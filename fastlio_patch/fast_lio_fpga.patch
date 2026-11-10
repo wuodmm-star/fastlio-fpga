@@ -1,0 +1,771 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index be3040b..62f100b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -57,7 +57,7 @@ find_package(sensor_msgs REQUIRED)
+ find_package(std_msgs REQUIRED)
+ find_package(std_srvs REQUIRED)
+ find_package(visualization_msgs REQUIRED)
+-find_package(pcl_ros REQUIRED)
++find_package(tf2_ros REQUIRED)  # fpga_lio: was pulled in via pcl_ros (not installed); pcl_ros itself is unused in code
+ find_package(pcl_conversions REQUIRED)
+ find_package(livox_ros_driver2 REQUIRED)
+ find_package(rosidl_default_generators REQUIRED)
+@@ -71,8 +71,9 @@ set(dependencies
+   std_msgs
+   std_srvs
+   visualization_msgs
+-  pcl_ros
++  
+   pcl_conversions
++  tf2_ros
+   livox_ros_driver2
+ )
+ 
+diff --git a/include/IKFoM_toolkit/esekfom/esekfom.hpp b/include/IKFoM_toolkit/esekfom/esekfom.hpp
+index 7547584..43fd11f 100755
+--- a/include/IKFoM_toolkit/esekfom/esekfom.hpp
++++ b/include/IKFoM_toolkit/esekfom/esekfom.hpp
+@@ -86,6 +86,10 @@ struct dyn_share_datastruct
+ 	Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> h_v;
+ 	Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> h_x;
+ 	Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> R;
++	// fpga_hth hook (2026-11-10): if ext_hth is true, H^T H and H^T h come from outside (FPGA or its software model)
++	bool ext_hth = false;
++	Eigen::Matrix<T, 12, 12> HTH_ext;
++	Eigen::Matrix<T, 12, 1> HTh_ext;
+ };
+ 
+ //used for iterated error state EKF update
+@@ -1781,7 +1785,8 @@ public:
+ 			#else
+ 				cov P_temp = (P_/R).inverse();
+ 				//Eigen::Matrix<scalar_type, 12, Eigen::Dynamic> h_T = h_x_.transpose();
+-				Eigen::Matrix<scalar_type, 12, 12> HTH = h_x_.transpose() * h_x_; 
++				Eigen::Matrix<scalar_type, 12, 12> HTH;
++				if (dyn_share.ext_hth) HTH = dyn_share.HTH_ext; else HTH = h_x_.transpose() * h_x_;
+ 				P_temp. template block<12, 12>(0, 0) += HTH;
+ 				/*
+ 				Eigen::Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> h_x_cur = Eigen::Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic>::Zero(dof_Measurement, n);
+@@ -1801,7 +1806,8 @@ public:
+ 				*/
+ 				cov P_inv = P_temp.inverse();
+ 				//std::cout << "line 1781" << std::endl;
+-				K_h = P_inv. template block<n, 12>(0, 0) * h_x_.transpose() * dyn_share.h;
++				if (dyn_share.ext_hth) K_h = P_inv. template block<n, 12>(0, 0) * dyn_share.HTh_ext;
++				else K_h = P_inv. template block<n, 12>(0, 0) * h_x_.transpose() * dyn_share.h;
+ 				//std::cout << "line 1780" << std::endl;
+ 				//cov HTH_cur = cov::Zero();
+ 				//HTH_cur. template block<12, 12>(0, 0) = HTH;
+diff --git a/package.xml b/package.xml
+index 8c39e18..fff2d7a 100644
+--- a/package.xml
++++ b/package.xml
+@@ -25,7 +25,7 @@
+   <depend>sensor_msgs</depend>
+   <depend>common_interfaces</depend>
+   <depend>tf2</depend>
+-  <depend>pcl_ros</depend>
++  <depend>tf2_ros</depend>  <!-- fpga_lio: pcl_ros unused in code -->
+   <depend>pcl_conversions</depend>
+   <depend>livox_ros_driver2</depend>
+ 
+diff --git a/src/laserMapping.cpp b/src/laserMapping.cpp
+index e5d9950..4fc5e4c 100644
+--- a/src/laserMapping.cpp
++++ b/src/laserMapping.cpp
+@@ -32,6 +32,8 @@
+ // CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ // POSSIBILITY OF SUCH DAMAGE.
++#include "fpga_hth.hpp"
++#include "voxmap.hpp"
+ #include <omp.h>
+ #include <mutex>
+ #include <math.h>
+@@ -480,6 +482,20 @@ void map_incremental()
+     double st_time = omp_get_wtime();
+     add_point_size = ikdtree.Add_Points(PointToAdd, true);
+     ikdtree.Add_Points(PointNoNeedDownsample, false); 
++    if (voxmap::enabled()) {                                   // keep the voxel map in step with the ikd-tree
++        for (auto &p : PointToAdd)            { float v[3] = {p.x, p.y, p.z}; voxmap::add(v, true); }
++        for (auto &p : PointNoNeedDownsample) { float v[3] = {p.x, p.y, p.z}; voxmap::add(v, false); }
++        if (voxmap::mode() == 3) voxmap::fpga().flush_adds();
++        static int nscan = 0;
++        if (voxmap::mode() == 3 && ++nscan % 300 == 0) {
++            auto &F = voxmap::fpga();
++            fprintf(stderr, "[voxmap] scan %d: FPGA %ld adds (%.3f ms/scan), %ld searches (%.2f us each incl. network), %ld packets%s\n",
++                    nscan, F.n_add, 1e3 * F.t_add / nscan, F.n_search, 1e6 * F.t_search / std::max(1L, F.n_search), F.n_pkt, F.ok ? "" : " [ERROR]");
++        }
++        if (voxmap::mode() == 2 && ++nscan % 300 == 0)
++            fprintf(stderr, "[voxmap] scan %d: %ld voxels in the 2^16 x 8-slot table, %ld dropped (no free slot)\n",
++                    nscan, voxmap::mapfx().n_voxels, voxmap::mapfx().dropped);
++    }
+     add_point_size = PointToAdd.size() + PointNoNeedDownsample.size();
+     kdtree_incremental_time = omp_get_wtime() - st_time;
+ }
+@@ -632,6 +648,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
+     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
+     set_posestamp(odomAftMapped.pose);
+     pubOdomAftMapped->publish(odomAftMapped);
++    fpga_hth::write_traj(lidar_end_time, state_point.pos, Eigen::Quaterniond(state_point.rot.coeffs()[3], state_point.rot.coeffs()[0], state_point.rot.coeffs()[1], state_point.rot.coeffs()[2]));
+     auto P = kf.get_P();
+     for (int i = 0; i < 6; i ++)
+     {
+@@ -676,11 +693,25 @@ void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
+ 
+ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data)
+ {
++    ekfom_data.ext_hth = false;
+     double match_start = omp_get_wtime();
+     laserCloudOri->clear(); 
+     corr_normvect->clear(); 
+     total_residual = 0.0; 
+ 
++    /** FPGA map: all nearest-neighbour searches of this iteration in one batch, before the parallel loop **/
++    std::vector<int> fp_found; std::vector<std::array<float, 15>> fp_pts; std::vector<std::array<float, 5>> fp_d2;
++    if (voxmap::mode() == 3 && ekfom_data.converge) {
++        std::vector<std::array<float, 3>> q(feats_down_size);
++        for (int i = 0; i < feats_down_size; i++) {
++            const PointType &pb = feats_down_body->points[i];
++            V3D p_body(pb.x, pb.y, pb.z);
++            V3D p_global(s.rot * (s.offset_R_L_I*p_body + s.offset_T_L_I) + s.pos);
++            q[i] = {(float)p_global(0), (float)p_global(1), (float)p_global(2)};      // exactly what point_world gets
++        }
++        voxmap::fpga().search_batch(q, fp_found, fp_pts, fp_d2);
++    }
++
+     /** closest surface search and residual computation **/
+     #ifdef MP_EN
+         omp_set_num_threads(MP_PROC_NUM);
+@@ -706,6 +737,22 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
+         if (ekfom_data.converge)
+         {
+             /** Find the closest surfaces in the map **/
++            if (voxmap::mode() == 3) {
++                int nf = fp_found.empty() ? 0 : fp_found[i];
++                points_near.resize(nf);
++                for (int k = 0; k < nf; k++) {
++                    points_near[k].x = fp_pts[i][3 * k]; points_near[k].y = fp_pts[i][3 * k + 1]; points_near[k].z = fp_pts[i][3 * k + 2];
++                    pointSearchSqDis[k] = fp_d2[i][k];
++                }
++            } else if (voxmap::enabled()) {
++                float q[3] = {point_world.x, point_world.y, point_world.z}, nb[NUM_MATCH_POINTS][3], d2[NUM_MATCH_POINTS];
++                int nf = voxmap::search(q, NUM_MATCH_POINTS, nb, d2);
++                points_near.resize(nf);
++                for (int k = 0; k < nf; k++) {
++                    points_near[k].x = nb[k][0]; points_near[k].y = nb[k][1]; points_near[k].z = nb[k][2];
++                    pointSearchSqDis[k] = d2[k];
++                }
++            } else
+             ikdtree.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis);
+             point_selected_surf[i] = points_near.size() < NUM_MATCH_POINTS ? false : pointSearchSqDis[NUM_MATCH_POINTS - 1] > 5 ? false : true;
+         }
+@@ -790,6 +837,11 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
+         /*** Measuremnt: distance to the closest surface/corner ***/
+         ekfom_data.h(i) = -norm_p.intensity;
+     }
++    // fpga_hth: dump / fixed-point model / FPGA (only for the 6-column H, i.e. extrinsic estimation off)
++    if (!extrinsic_est_en)
++        ekfom_data.ext_hth = fpga_hth::compute(s.rot.toRotationMatrix(), s.offset_R_L_I.toRotationMatrix(), s.offset_T_L_I,
++                                               laserCloudOri, corr_normvect, effct_feat_num, ekfom_data.h_x, ekfom_data.h,
++                                               ekfom_data.HTH_ext, ekfom_data.HTh_ext);
+     solve_time += omp_get_wtime() - solve_start_;
+ }
+ 
+@@ -924,9 +976,9 @@ public:
+         }
+         else
+         {
+-            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
++            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::QoS(200).reliable(), standard_pcl_cbk);  // 2026-11-10: was SensorDataQoS (best effort, depth 5) -> dropped ~2/3 of bag scans
+         }
+-        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
++        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, rclcpp::QoS(5000).reliable(), imu_cbk);  // 2026-11-10: was depth 10
+         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
+         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
+         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
+@@ -1009,6 +1061,9 @@ private:
+                         pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
+                     }
+                     ikdtree.Build(feats_down_world->points);
++                    if (voxmap::enabled())
++                        for (auto &p : feats_down_world->points) { float v[3] = {p.x, p.y, p.z}; voxmap::add(v, false); }
++                    if (voxmap::mode() == 3) voxmap::fpga().flush_adds();
+                 }
+                 return;
+             }
+diff --git a/config/ntu_viral.yaml b/config/ntu_viral.yaml
+new file mode 100644
+index 0000000..2e11c47
+--- /dev/null
++++ b/config/ntu_viral.yaml
+@@ -0,0 +1,46 @@
++# NTU-VIRAL (horizontal Ouster OS1-16 + VectorNav VN100), added 2026-11-10 for the FPGA HTH experiment
++/**:
++    ros__parameters:
++        feature_extract_enable: false
++        point_filter_num: 3
++        max_iteration: 3
++        filter_size_surf: 0.5
++        filter_size_map: 0.5
++        cube_side_length: 1000.0
++        runtime_pos_log_enable: false
++        map_file_path: "./test.pcd"
++
++        common:
++            lid_topic:  "/os1_cloud_node1/points"
++            imu_topic:  "/imu/imu"
++            time_sync_en: false
++            time_offset_lidar_to_imu: 0.0
++
++        preprocess:
++            lidar_type: 3
++            scan_line: 16
++            timestamp_unit: 3
++            blind: 0.5
++
++        mapping:
++            acc_cov: 0.1
++            gyr_cov: 0.1
++            b_acc_cov: 0.0001
++            b_gyr_cov: 0.0001
++            fov_degree:    360.0
++            det_range:     100.0
++            extrinsic_est_en:  false
++            extrinsic_T: [ -0.050, 0.0, 0.055 ]       # T_Body_Lidar from lidar_horz.yaml (body = IMU)
++            extrinsic_R: [1., 0., 0.,
++                          0., 1., 0.,
++                          0., 0., 1.]
++
++        publish:
++            path_en:  false
++            scan_publish_en:  false
++            dense_publish_en: false
++            scan_bodyframe_pub_en: false
++
++        pcd_save:
++            pcd_save_en: false
++            interval: -1
+diff --git a/include/fpga_hth.hpp b/include/fpga_hth.hpp
+new file mode 100644
+index 0000000..3350684
+--- /dev/null
++++ b/include/fpga_hth.hpp
+@@ -0,0 +1,199 @@
++// fpga_hth.hpp - hook that lets FAST-LIO get H^T H and H^T h from somewhere else than Eigen (added 2026-11-10)
++//
++// Controlled by environment variables (nothing changes when none is set):
++//   FPGA_HTH_MODE = cpu    : normal FAST-LIO (default)
++//                 = fixed  : software model of the FPGA fixed-point arithmetic (bit-identical to the board)
++//                 = fpga   : send the points to the board over UDP and use its answer
++//   FPGA_HTH_DUMP = file   : append every iteration's inputs + CPU (float64) result to a binary file
++//   FPGA_HTH_HOST = 192.168.137.234 (default), FPGA_HTH_PORT = 1234
++//   FPGA_HTH_TRAJ = file   : write the state after every scan as a TUM trajectory
++// Formats and protocol: fpga_lio/fpga/hth/SPEC.md
++#pragma once
++#include <Eigen/Core>
++#include <Eigen/Geometry>
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <sys/socket.h>
++#include <sys/time.h>
++#include <unistd.h>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++namespace fpga_hth {
++
++typedef __int128 i128;
++
++struct Point { int32_t pb[3], n[3], pd2; };
++
++struct Config {
++    std::string mode = "cpu";
++    FILE *dump = nullptr;
++    FILE *traj = nullptr;
++    int sock = -1;
++    sockaddr_in board{};
++    uint16_t iter_id = 0;
++    long n_calls = 0, n_retries = 0, n_points = 0;
++    double t_total = 0.0;
++};
++
++inline Config &cfg() {
++    static Config c;
++    static bool init = false;
++    if (!init) {
++        init = true;
++        if (const char *m = getenv("FPGA_HTH_MODE")) c.mode = m;
++        if (const char *d = getenv("FPGA_HTH_DUMP")) c.dump = fopen(d, "wb");
++        if (const char *t = getenv("FPGA_HTH_TRAJ")) c.traj = fopen(t, "w");
++        if (c.mode == "fpga") {
++            const char *host = getenv("FPGA_HTH_HOST"); const char *port = getenv("FPGA_HTH_PORT");
++            c.sock = socket(AF_INET, SOCK_DGRAM, 0);
++            sockaddr_in me{}; me.sin_family = AF_INET; me.sin_addr.s_addr = INADDR_ANY; me.sin_port = 0;
++            bind(c.sock, (sockaddr *)&me, sizeof(me));
++            int buf = 4 << 20; setsockopt(c.sock, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
++            timeval tv{0, 200000}; setsockopt(c.sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++            c.board.sin_family = AF_INET;
++            c.board.sin_port = htons(port ? atoi(port) : 1234);
++            inet_pton(AF_INET, host ? host : "192.168.137.234", &c.board.sin_addr);
++        }
++        fprintf(stderr, "[fpga_hth] mode=%s dump=%s traj=%s\n", c.mode.c_str(), c.dump ? "on" : "off", c.traj ? "on" : "off");
++    }
++    return c;
++}
++
++inline int32_t q(double x, int frac) {
++    double v = std::nearbyint(x * double(1LL << frac));
++    if (v > 2147483647.0 || v < -2147483648.0) { fprintf(stderr, "[fpga_hth] value %g does not fit Q%d\n", x, frac); abort(); }
++    return (int32_t)v;
++}
++
++// ---------------------------------------------------------------- golden fixed-point model (same as hth_model.py)
++inline void fixed_sums(const int32_t R[9], const int32_t RL[9], const int32_t tL[3], const std::vector<Point> &pts, i128 S[27]) {
++    for (int k = 0; k < 27; k++) S[k] = 0;
++    for (const Point &P : pts) {
++        int64_t p[3], C[3], A[3], H[6];
++        for (int i = 0; i < 3; i++)
++            p[i] = (int32_t)(int64_t)(((i128)RL[3 * i] * P.pb[0] + (i128)RL[3 * i + 1] * P.pb[1] + (i128)RL[3 * i + 2] * P.pb[2] + ((i128)tL[i] << 30)) >> 30);
++        for (int i = 0; i < 3; i++)
++            C[i] = (int32_t)(int64_t)(((i128)R[i] * P.n[0] + (i128)R[3 + i] * P.n[1] + (i128)R[6 + i] * P.n[2]) >> 30);
++        A[0] = (int64_t)(((i128)p[1] * C[2] - (i128)p[2] * C[1]) >> 30);
++        A[1] = (int64_t)(((i128)p[2] * C[0] - (i128)p[0] * C[2]) >> 30);
++        A[2] = (int64_t)(((i128)p[0] * C[1] - (i128)p[1] * C[0]) >> 30);
++        for (int i = 0; i < 3; i++) { H[i] = P.n[i]; H[3 + i] = (int32_t)A[i]; }   // board keeps 32 bits
++        int s = 0;
++        for (int i = 0; i < 6; i++) for (int j = i; j < 6; j++) S[s++] += (i128)H[i] * H[j];
++        for (int i = 0; i < 6; i++) S[21 + i] -= (i128)H[i] * P.pd2;
++    }
++}
++
++inline void sums_to_float(const i128 S[27], Eigen::Matrix<double, 12, 12> &HTH, Eigen::Matrix<double, 12, 1> &HTh) {
++    static const int sc[6] = {30, 30, 30, 16, 16, 16};
++    HTH.setZero(); HTh.setZero();
++    int s = 0;
++    for (int i = 0; i < 6; i++) for (int j = i; j < 6; j++) {
++        double v = (double)S[s++] / std::ldexp(1.0, sc[i] + sc[j]);
++        HTH(i, j) = HTH(j, i) = v;
++    }
++    for (int i = 0; i < 6; i++) HTh(i) = (double)S[21 + i] / std::ldexp(1.0, sc[i] + 24);
++}
++
++// ---------------------------------------------------------------- UDP client
++inline void put32(std::vector<uint8_t> &b, uint32_t w) { b.push_back(w >> 24); b.push_back(w >> 16); b.push_back(w >> 8); b.push_back(w); }
++
++inline bool fpga_sums(Config &c, const int32_t R[9], const int32_t RL[9], const int32_t tL[3], const std::vector<Point> &pts, i128 S[27]) {
++    for (int attempt = 0; attempt < 5; attempt++) {
++        uint16_t id = ++c.iter_id;
++        std::vector<std::vector<uint8_t>> pk;
++        pk.emplace_back(); put32(pk.back(), 0xA5000000u | (2u << 16) | 0u);           // warm-up: POINTS with 0 points (ignored)
++        pk.emplace_back(); put32(pk.back(), 0xA5000000u | (1u << 16) | id);           // BEGIN
++        for (int i = 0; i < 9; i++) put32(pk.back(), R[i]);
++        for (int i = 0; i < 9; i++) put32(pk.back(), RL[i]);
++        for (int i = 0; i < 3; i++) put32(pk.back(), tL[i]);
++        for (size_t s = 0; s < pts.size(); s += 41) {
++            size_t e = std::min(pts.size(), s + 41);
++            std::vector<uint8_t> p; put32(p, 0xA5000000u | (2u << 16) | (uint32_t)(e - s));
++            for (size_t k = s; k < e; k++) {
++                for (int i = 0; i < 3; i++) put32(p, pts[k].pb[i]);
++                for (int i = 0; i < 3; i++) put32(p, pts[k].n[i]);
++                put32(p, pts[k].pd2);
++            }
++            pk.push_back(p);
++        }
++        pk.emplace_back(); put32(pk.back(), 0xA5000000u | (3u << 16));
++        for (auto &p : pk) sendto(c.sock, p.data(), p.size(), 0, (sockaddr *)&c.board, sizeof(c.board));
++        uint8_t rx[512];
++        while (true) {
++            ssize_t n = recv(c.sock, rx, sizeof(rx), 0);
++            if (n < 0) break;                                                           // timeout -> retry
++            if (n != 340) continue;
++            auto w = [&](int i) { return ((uint32_t)rx[4 * i] << 24) | ((uint32_t)rx[4 * i + 1] << 16) | ((uint32_t)rx[4 * i + 2] << 8) | rx[4 * i + 3]; };
++            if ((w(0) & 0xFFFF) != id) continue;                                        // stale reply
++            if (w(1) != pts.size() || (w(2) >> 16) != 0 || (w(2) & 1)) break;          // lost packet -> retry
++            for (int k = 0; k < 27; k++) {
++                uint64_t hi = w(4 + 3 * k), mid = w(5 + 3 * k), lo = w(6 + 3 * k);
++                i128 v = ((i128)(int32_t)hi << 64) | ((i128)mid << 32) | lo;            // hi is sign-extended
++                S[k] = v;
++            }
++            return true;
++        }
++        c.n_retries++;
++    }
++    fprintf(stderr, "[fpga_hth] board did not answer correctly 5 times\n");
++    return false;
++}
++
++// ---------------------------------------------------------------- entry point used by h_share_model
++// R = s.rot, RL/tL = extrinsic, pts in float. h_x (n x 12) and h are already filled by FAST-LIO (used for dump only).
++template <class M3, class V3, class PCL, class HX, class HV>
++inline bool compute(const M3 &Rf, const M3 &RLf, const V3 &tLf, const PCL &laser, const PCL &norm, int npts,
++                    const HX &h_x, const HV &h, Eigen::Matrix<double, 12, 12> &HTH, Eigen::Matrix<double, 12, 1> &HTh) {
++    Config &c = cfg();
++    if (c.dump) {   // record: npts, R, RL, tL (double), then per point pb(3) n(3) pd2 (float), then CPU HTH 6x6 + HTh 6 (double)
++        int32_t n32 = npts; fwrite(&n32, 4, 1, c.dump);
++        double m[21];
++        for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) { m[3 * i + j] = Rf(i, j); m[9 + 3 * i + j] = RLf(i, j); }
++        for (int i = 0; i < 3; i++) m[18 + i] = tLf(i);
++        fwrite(m, 8, 21, c.dump);
++        for (int k = 0; k < npts; k++) {
++            float f[7] = {laser->points[k].x, laser->points[k].y, laser->points[k].z, norm->points[k].x, norm->points[k].y, norm->points[k].z, norm->points[k].intensity};
++            fwrite(f, 4, 7, c.dump);
++        }
++        Eigen::Matrix<double, 6, 6> A = h_x.leftCols(6).transpose() * h_x.leftCols(6);
++        Eigen::Matrix<double, 6, 1> b = h_x.leftCols(6).transpose() * h;
++        fwrite(A.data(), 8, 36, c.dump); fwrite(b.data(), 8, 6, c.dump);
++    }
++    if (c.mode == "cpu") return false;
++    struct timeval t0, t1; gettimeofday(&t0, nullptr);
++    int32_t R[9], RL[9], tL[3];
++    for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) { R[3 * i + j] = q(Rf(i, j), 30); RL[3 * i + j] = q(RLf(i, j), 30); }
++    for (int i = 0; i < 3; i++) tL[i] = q(tLf(i), 16);
++    std::vector<Point> pts(npts);
++    for (int k = 0; k < npts; k++) {
++        pts[k].pb[0] = q(laser->points[k].x, 16); pts[k].pb[1] = q(laser->points[k].y, 16); pts[k].pb[2] = q(laser->points[k].z, 16);
++        pts[k].n[0] = q(norm->points[k].x, 30); pts[k].n[1] = q(norm->points[k].y, 30); pts[k].n[2] = q(norm->points[k].z, 30);
++        pts[k].pd2 = q(norm->points[k].intensity, 24);
++    }
++    i128 S[27];
++    if (c.mode == "fpga") { if (!fpga_sums(c, R, RL, tL, pts, S)) return false; }
++    else fixed_sums(R, RL, tL, pts, S);
++    sums_to_float(S, HTH, HTh);
++    gettimeofday(&t1, nullptr);
++    c.n_calls++; c.n_points += npts; c.t_total += (t1.tv_sec - t0.tv_sec) + 1e-6 * (t1.tv_usec - t0.tv_usec);
++    if (c.n_calls % 2000 == 0)
++        fprintf(stderr, "[fpga_hth] %ld iterations, %ld points, %.3f ms/iteration, %ld retries\n",
++                c.n_calls, c.n_points, 1e3 * c.t_total / c.n_calls, c.n_retries);
++    return true;
++}
++
++inline void write_traj(double t, const Eigen::Vector3d &p, const Eigen::Quaterniond &qt) {
++    Config &c = cfg();
++    if (!c.traj) return;
++    fprintf(c.traj, "%.9f %.6f %.6f %.6f %.9f %.9f %.9f %.9f\n", t, p.x(), p.y(), p.z(), qt.x(), qt.y(), qt.z(), qt.w());
++    fflush(c.traj);
++}
++
++}  // namespace fpga_hth
+diff --git a/include/voxmap.hpp b/include/voxmap.hpp
+new file mode 100644
+index 0000000..dafa88c
+--- /dev/null
++++ b/include/voxmap.hpp
+@@ -0,0 +1,311 @@
++// voxmap.hpp - FPGA-friendly replacement for the ikd-tree map (added 2026-11-10, phase 0 of the FPGA NN-search work)
++//
++// The map is a hash of 0.5 m voxels; each voxel holds at most CAP points (fixed-size bucket = one SDRAM burst later).
++// Insertion copies FAST-LIO's rules:
++//   add(p, downsample=true)  : the voxel keeps only the single point closest to the voxel centre (ikd-tree downsample)
++//   add(p, downsample=false) : append if there is room, otherwise replace the stored point farthest from the centre
++// Search: look at all voxels within R voxels of the query voxel ((2R+1)^3 voxels) and return the K nearest points.
++// Enabled with FPGA_NN_MODE=voxel, FPGA_NN_R=1|2 (default 1). Nothing changes when FPGA_NN_MODE is not set.
++#pragma once
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <cstdlib>
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <omp.h>
++#include <sys/socket.h>
++#include <sys/time.h>
++#include <unistd.h>
++#include <array>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++namespace voxmap {
++
++const int CAP = 4;
++
++struct Bucket { int n = 0; float p[CAP][3]; };
++
++struct Map {
++    float vox = 0.5f;
++    int R = 1;
++    std::unordered_map<uint64_t, Bucket> m;
++    long n_points = 0;
++
++    static uint64_t key(int x, int y, int z) {
++        return ((uint64_t)(uint32_t)(x & 0x1FFFFF) << 42) | ((uint64_t)(uint32_t)(y & 0x1FFFFF) << 21) | (uint64_t)(uint32_t)(z & 0x1FFFFF);
++    }
++    void vidx(const float *p, int &x, int &y, int &z) const {
++        x = (int)std::floor(p[0] / vox); y = (int)std::floor(p[1] / vox); z = (int)std::floor(p[2] / vox);
++    }
++    float dc2(const float *p, int x, int y, int z) const {      // squared distance to the voxel centre
++        float cx = (x + 0.5f) * vox - p[0], cy = (y + 0.5f) * vox - p[1], cz = (z + 0.5f) * vox - p[2];
++        return cx * cx + cy * cy + cz * cz;
++    }
++    void add(const float *p, bool downsample) {
++        int x, y, z; vidx(p, x, y, z);
++        Bucket &b = m[key(x, y, z)];
++        if (downsample) {
++            float best = dc2(p, x, y, z); const float *bp = p;
++            for (int i = 0; i < b.n; i++) { float d = dc2(b.p[i], x, y, z); if (d < best) { best = d; bp = b.p[i]; } }
++            float keep[3] = {bp[0], bp[1], bp[2]};
++            n_points -= b.n - 1;
++            b.n = 1; std::memcpy(b.p[0], keep, sizeof(keep));
++        } else if (b.n < CAP) {
++            std::memcpy(b.p[b.n++], p, 3 * sizeof(float)); n_points++;
++        } else {
++            int far = 0; float fd = -1;
++            for (int i = 0; i < CAP; i++) { float d = dc2(b.p[i], x, y, z); if (d > fd) { fd = d; far = i; } }
++            std::memcpy(b.p[far], p, 3 * sizeof(float));
++        }
++    }
++    // K nearest within the (2R+1)^3 neighbourhood; out sorted by distance; returns count found
++    int search(const float *q, int K, float (*out)[3], float *d2) const {
++        int x, y, z; vidx(q, x, y, z);
++        int found = 0;
++        for (int dx = -R; dx <= R; dx++) for (int dy = -R; dy <= R; dy++) for (int dz = -R; dz <= R; dz++) {
++            auto it = m.find(key(x + dx, y + dy, z + dz));
++            if (it == m.end()) continue;
++            const Bucket &b = it->second;
++            for (int i = 0; i < b.n; i++) {
++                float ex = b.p[i][0] - q[0], ey = b.p[i][1] - q[1], ez = b.p[i][2] - q[2];
++                float d = ex * ex + ey * ey + ez * ez;
++                // insertion into the sorted K-list
++                int j = found < K ? found++ : K;
++                if (j == K) { if (d >= d2[K - 1]) continue; j = K - 1; }
++                while (j > 0 && d2[j - 1] > d) { d2[j] = d2[j - 1]; std::memcpy(out[j], out[j - 1], 3 * sizeof(float)); j--; }
++                d2[j] = d; out[j][0] = b.p[i][0]; out[j][1] = b.p[i][1]; out[j][2] = b.p[i][2];
++            }
++        }
++        return found;
++    }
++};
++
++// ---------------------------------------------------------------------------------------------------------------
++// MapFx: the exact rules the FPGA will implement (phase 1 golden model). FPGA_NN_MODE=voxfx
++//   coordinates int32 Q16.16 metres; voxel index = coord >> 15 (0.5 m = 2^15); the low 15 bits are the offset inside
++//   the voxel, so the FPGA stores a point as 3 x 16-bit offsets without losing anything.
++//   table: 2^16 groups x 8 slots (one group = 128 SDRAM words = one row segment); group = bits 8..23 of
++//   (uint32)(x + 1021*y + 262147*z) * 2654435761; a voxel lives in the first free slot of its group (tag = voxel
++//   index); if all 8 are taken by other voxels it is dropped (counted). Distances are exact int64.
++//   (first version used 2^18 slots, hash = low bits XOR, probe 2 -> 1.45 M dropped adds on eee_03)
++//   Search order (matters for ties): dx, dy, dz = -1..1 (dz fastest), points in slot order; a later point
++//   replaces an earlier one only if strictly closer.
++// ---------------------------------------------------------------------------------------------------------------
++struct MapFx {
++    static const int NGROUP = 1 << 16, WAYS = 8, NSLOT = NGROUP * WAYS;
++    struct Slot { int n = 0; int32_t v[3]; int32_t p[CAP][3]; };
++    std::vector<Slot> t;
++    long dropped = 0, n_voxels = 0;
++    MapFx() : t(NSLOT) {}
++
++    static int32_t fx(float a) { return (int32_t)std::lrint((double)a * 65536.0); }
++    static uint32_t group(const int32_t *v) {
++        uint32_t s = (uint32_t)v[0] + (uint32_t)v[1] * 1021u + (uint32_t)v[2] * 262147u;
++        return ((s * 2654435761u) >> 8) & (NGROUP - 1);
++    }
++    static int64_t dc2(const int32_t *p, const int32_t *v) {          // squared distance to the voxel centre, Q32
++        int64_t s = 0;
++        for (int i = 0; i < 3; i++) { int64_t c = ((int64_t)v[i] << 15) + (1 << 14), d = c - p[i]; s += d * d; }
++        return s;
++    }
++    Slot *find(const int32_t *v, bool create) {
++        uint32_t g = group(v) * WAYS;
++        for (int k = 0; k < WAYS; k++) {
++            Slot &s = t[g + k];
++            if (s.n > 0 && s.v[0] == v[0] && s.v[1] == v[1] && s.v[2] == v[2]) return &s;
++        }
++        if (!create) return nullptr;
++        for (int k = 0; k < WAYS; k++) {
++            Slot &s = t[g + k];
++            if (s.n == 0) { s.v[0] = v[0]; s.v[1] = v[1]; s.v[2] = v[2]; n_voxels++; return &s; }
++        }
++        dropped++;
++        return nullptr;
++    }
++    void add(const float *pf, bool downsample) {
++        int32_t p[3] = {fx(pf[0]), fx(pf[1]), fx(pf[2])}, v[3] = {p[0] >> 15, p[1] >> 15, p[2] >> 15};
++        Slot *s = find(v, true);
++        if (!s) return;
++        if (s->n == 0) { std::memcpy(s->p[0], p, sizeof(p)); s->n = 1; return; }
++        if (downsample) {
++            int64_t best = dc2(p, v); const int32_t *bp = p;
++            for (int i = 0; i < s->n; i++) { int64_t d = dc2(s->p[i], v); if (d < best) { best = d; bp = s->p[i]; } }
++            int32_t keep[3] = {bp[0], bp[1], bp[2]};
++            s->n = 1; std::memcpy(s->p[0], keep, sizeof(keep));
++        } else if (s->n < CAP) {
++            std::memcpy(s->p[s->n++], p, sizeof(p));
++        } else {
++            int far = 0; int64_t fd = -1;
++            for (int i = 0; i < CAP; i++) { int64_t d = dc2(s->p[i], v); if (d > fd) { fd = d; far = i; } }
++            std::memcpy(s->p[far], p, sizeof(p));
++        }
++    }
++    int search(const float *qf, int K, float (*out)[3], float *d2f) {
++        int32_t q[3] = {fx(qf[0]), fx(qf[1]), fx(qf[2])}, v0[3] = {q[0] >> 15, q[1] >> 15, q[2] >> 15};
++        int64_t d2[8]; int32_t o[8][3]; int found = 0;
++        for (int dx = -1; dx <= 1; dx++) for (int dy = -1; dy <= 1; dy++) for (int dz = -1; dz <= 1; dz++) {
++            int32_t v[3] = {v0[0] + dx, v0[1] + dy, v0[2] + dz};
++            Slot *s = find(v, false);
++            if (!s) continue;
++            for (int i = 0; i < s->n; i++) {
++                int64_t ex = s->p[i][0] - q[0], ey = s->p[i][1] - q[1], ez = s->p[i][2] - q[2];
++                int64_t d = ex * ex + ey * ey + ez * ez;
++                int j;
++                if (found < K) j = found++;
++                else { if (d >= d2[K - 1]) continue; j = K - 1; }
++                while (j > 0 && d2[j - 1] > d) { d2[j] = d2[j - 1]; std::memcpy(o[j], o[j - 1], sizeof(o[0])); j--; }
++                d2[j] = d; o[j][0] = s->p[i][0]; o[j][1] = s->p[i][1]; o[j][2] = s->p[i][2];
++            }
++        }
++        for (int k = 0; k < found; k++) {
++            for (int i = 0; i < 3; i++) out[k][i] = (float)(o[k][i] / 65536.0);
++            d2f[k] = (float)(d2[k] / 4294967296.0);
++        }
++        return found;
++    }
++};
++
++inline int mode() {      // 0 off, 1 float voxel map, 2 fixed-point (FPGA rules)
++    static int e = -1;
++    if (e < 0) {
++        const char *m = getenv("FPGA_NN_MODE");
++        e = !m ? 0 : std::string(m) == "voxel" ? 1 : std::string(m) == "voxfx" ? 2 : std::string(m) == "fpga" ? 3 : 0;
++    }
++    return e;
++}
++inline bool enabled() { return mode() != 0; }
++inline Map &map() {
++    static Map M;
++    static bool init = false;
++    if (!init) {
++        init = true;
++        if (const char *r = getenv("FPGA_NN_R")) M.R = atoi(r);
++        fprintf(stderr, "[voxmap] %s, R=%d (%d voxels per search), CAP=%d\n", enabled() ? "ON" : "off", M.R,
++                (2 * M.R + 1) * (2 * M.R + 1) * (2 * M.R + 1), CAP);
++    }
++    return M;
++}
++
++inline MapFx &mapfx() { static MapFx M; return M; }
++
++// FPGA_NN_DUMP=file (voxfx mode): record every operation as int32 records for the FPGA exam:
++//   ADD    : 1, downsample, x, y, z                       (Q16.16)
++//   SEARCH : 2, x, y, z, found, then 5 x (x, y, z, d2_hi, d2_lo)   (d2 in Q32, unused entries 0)
++inline FILE *nn_dump() {
++    static FILE *f = nullptr; static bool init = false;
++    if (!init) { init = true; if (const char *d = getenv("FPGA_NN_DUMP")) f = fopen(d, "wb"); }
++    return f;
++}
++// ---------------------------------------------------------------------------------------------------------------
++// FPGA_NN_MODE=fpga : the map lives in the board's SDRAM (fpga_lio/fpga/nn). Same rules as MapFx, so the answers are
++// bit-identical to mode voxfx. Adds are buffered and sent once per scan (flush_adds); searches are sent in batches.
++// Packets: 0xA511|n + n ops x {flags, x, y, z} (<= 72 ops, <= 18 searches); 0xA513 = clear; reply 0xA512|n + n x 16 words.
++// ---------------------------------------------------------------------------------------------------------------
++struct FpgaNN {
++    int sock = -1; sockaddr_in board{}; bool ok = false;
++    std::vector<std::array<int32_t, 4>> pending_adds;
++    long n_add = 0, n_search = 0, n_pkt = 0; double t_add = 0, t_search = 0;
++    static void put(std::vector<uint8_t> &b, uint32_t w) { b.push_back(w >> 24); b.push_back(w >> 16); b.push_back(w >> 8); b.push_back(w); }
++    void init() {
++        sock = socket(AF_INET, SOCK_DGRAM, 0);
++        sockaddr_in me{}; me.sin_family = AF_INET; me.sin_addr.s_addr = INADDR_ANY; bind(sock, (sockaddr *)&me, sizeof(me));
++        int buf = 4 << 20; setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf)); setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
++        timeval tv{1, 0}; setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++        const char *host = getenv("FPGA_HTH_HOST");
++        board.sin_family = AF_INET; board.sin_port = htons(1234); inet_pton(AF_INET, host ? host : "192.168.137.234", &board.sin_addr);
++        std::vector<uint8_t> c; put(c, 0xA5130000u);                       // clear the map on the board
++        sendto(sock, c.data(), c.size(), 0, (sockaddr *)&board, sizeof(board));
++        uint8_t rx[2048]; ok = recv(sock, rx, sizeof(rx), 0) >= 4;
++        fprintf(stderr, "[voxmap] FPGA map %s (window %s packets)\n", ok ? "cleared, ready" : "DID NOT ANSWER",
++                getenv("FPGA_NN_WINDOW") ? getenv("FPGA_NN_WINDOW") : "16");
++    }
++    // send packets with up to W in flight, collect replies in order; out_words gets every reply's search words
++    // W = packets in flight. The board's receive FIFO holds 2048 words: a search packet is 73 words (16 fit),
++    // an add packet 289 words (at most 7 fit).
++    void run(const std::vector<std::vector<uint8_t>> &pk, std::vector<uint32_t> &out_words, size_t W) {
++        size_t sent = 0, got = 0; uint8_t rx[2048];
++        while (got < pk.size()) {
++            while (sent < pk.size() && sent - got < W) { sendto(sock, pk[sent].data(), pk[sent].size(), 0, (sockaddr *)&board, sizeof(board)); sent++; }
++            ssize_t n = recv(sock, rx, sizeof(rx), 0);
++            if (n < 4) { fprintf(stderr, "[voxmap] FPGA reply timeout (packet %zu of %zu) - map is now out of step\n", got, pk.size()); ok = false; return; }
++            for (ssize_t i = 4; i + 4 <= n; i += 4) out_words.push_back(((uint32_t)rx[i] << 24) | ((uint32_t)rx[i+1] << 16) | ((uint32_t)rx[i+2] << 8) | rx[i+3]);
++            got++;
++        }
++        n_pkt += pk.size();
++    }
++    void flush_adds() {
++        if (pending_adds.empty() || !ok) { pending_adds.clear(); return; }
++        double t0 = omp_get_wtime();
++        std::vector<std::vector<uint8_t>> pk;
++        for (size_t s = 0; s < pending_adds.size(); s += 72) {
++            size_t e = std::min(pending_adds.size(), s + 72);
++            std::vector<uint8_t> b; put(b, 0xA5110000u | (uint32_t)(e - s));
++            for (size_t k = s; k < e; k++) for (int i = 0; i < 4; i++) put(b, (uint32_t)pending_adds[k][i]);
++            pk.push_back(b);
++        }
++        std::vector<uint32_t> w; run(pk, w, 6);
++        n_add += pending_adds.size(); pending_adds.clear(); t_add += omp_get_wtime() - t0;
++    }
++    // q: n x 3 floats -> per query: found, 5 x 3 floats, 5 squared distances (same arithmetic as MapFx::search)
++    void search_batch(const std::vector<std::array<float, 3>> &q, std::vector<int> &found, std::vector<std::array<float, 15>> &pts,
++                      std::vector<std::array<float, 5>> &d2) {
++        double t0 = omp_get_wtime();
++        size_t n = q.size(); found.assign(n, 0); pts.resize(n); d2.resize(n);
++        if (!ok) return;
++        std::vector<std::vector<uint8_t>> pk; std::vector<std::array<int32_t, 3>> qi(n);
++        for (size_t s = 0; s < n; s += 18) {
++            size_t e = std::min(n, s + 18);
++            std::vector<uint8_t> b; put(b, 0xA5110000u | (uint32_t)(e - s));
++            for (size_t k = s; k < e; k++) {
++                qi[k] = {MapFx::fx(q[k][0]), MapFx::fx(q[k][1]), MapFx::fx(q[k][2])};
++                put(b, 1u); for (int i = 0; i < 3; i++) put(b, (uint32_t)qi[k][i]);
++            }
++            pk.push_back(b);
++        }
++        static const size_t WS = getenv("FPGA_NN_WINDOW") ? (size_t)atoi(getenv("FPGA_NN_WINDOW")) : 16;
++        std::vector<uint32_t> w; run(pk, w, WS);
++        if (w.size() < 16 * n) return;
++        for (size_t k = 0; k < n; k++) {
++            const uint32_t *r = &w[16 * k];
++            found[k] = (int)r[0];
++            for (int j = 0; j < found[k] && j < 5; j++) {
++                int32_t p[3] = {(int32_t)r[1 + 3 * j], (int32_t)r[2 + 3 * j], (int32_t)r[3 + 3 * j]};
++                int64_t ex = p[0] - qi[k][0], ey = p[1] - qi[k][1], ez = p[2] - qi[k][2];
++                for (int i = 0; i < 3; i++) pts[k][3 * j + i] = (float)(p[i] / 65536.0);
++                d2[k][j] = (float)((ex * ex + ey * ey + ez * ez) / 4294967296.0);
++            }
++        }
++        n_search += n; t_search += omp_get_wtime() - t0;
++    }
++};
++inline FpgaNN &fpga() { static FpgaNN F; static bool init = false; if (!init) { init = true; F.init(); } return F; }
++
++inline void add(const float *p, bool ds) {
++    if (mode() == 3) { fpga().pending_adds.push_back({ds ? 2 : 0, MapFx::fx(p[0]), MapFx::fx(p[1]), MapFx::fx(p[2])}); return; }
++    if (mode() == 2) {
++        if (FILE *f = nn_dump()) { int32_t r[5] = {1, ds ? 1 : 0, MapFx::fx(p[0]), MapFx::fx(p[1]), MapFx::fx(p[2])}; fwrite(r, 4, 5, f); }
++        mapfx().add(p, ds);
++    } else map().add(p, ds);
++}
++inline int search(const float *q, int K, float (*out)[3], float *d2) {
++    if (mode() != 2) return map().search(q, K, out, d2);
++    int n = mapfx().search(q, K, out, d2);
++    if (FILE *f = nn_dump()) {
++        int32_t r[5 + 25] = {2, MapFx::fx(q[0]), MapFx::fx(q[1]), MapFx::fx(q[2]), n};
++        for (int k = 0; k < n; k++) {
++            int64_t dd = (int64_t)std::llrint((double)d2[k] * 4294967296.0);
++            r[5 + 5 * k] = MapFx::fx(out[k][0]); r[6 + 5 * k] = MapFx::fx(out[k][1]); r[7 + 5 * k] = MapFx::fx(out[k][2]);
++            r[8 + 5 * k] = (int32_t)(dd >> 32); r[9 + 5 * k] = (int32_t)(dd & 0xFFFFFFFF);
++        }
++        #pragma omp critical(nn_dump)
++        fwrite(r, 4, 30, f);
++    }
++    return n;
++}
++
++}  // namespace voxmap

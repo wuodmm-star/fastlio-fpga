@@ -1,0 +1,48 @@
+# FAST-LIO HTH engine on 征途Pro (EP4CE10F17C8) - Quartus II 13.0 SP1
+set_global_assignment -name FAMILY "Cyclone IV E"
+set_global_assignment -name DEVICE EP4CE10F17C8
+set_global_assignment -name TOP_LEVEL_ENTITY lio_hth_top
+set_global_assignment -name ORIGINAL_QUARTUS_VERSION "13.0 SP1"
+set_global_assignment -name LAST_QUARTUS_VERSION "13.0 SP1"
+set_global_assignment -name PROJECT_OUTPUT_DIRECTORY output_files
+set_global_assignment -name MIN_CORE_JUNCTION_TEMP 0
+set_global_assignment -name MAX_CORE_JUNCTION_TEMP 85
+set_global_assignment -name DEVICE_FILTER_PACKAGE FBGA
+set_global_assignment -name DEVICE_FILTER_PIN_COUNT 256
+set_global_assignment -name DEVICE_FILTER_SPEED_GRADE 8
+set_global_assignment -name ERROR_CHECK_FREQUENCY_DIVISOR 1
+set_global_assignment -name NOMINAL_CORE_SUPPLY_VOLTAGE 1.2V
+set_global_assignment -name STRATIX_DEVICE_IO_STANDARD "2.5 V"
+set_global_assignment -name RESERVE_ALL_UNUSED_PINS_WEAK_PULLUP "AS INPUT TRI-STATED WITH WEAK PULL-UP"
+
+# pins: same as Embedfire 60_ethernet_udp_rmii
+set_location_assignment PIN_M15 -to sys_rst_n
+set_location_assignment PIN_C3 -to eth_clk
+set_location_assignment PIN_B3 -to eth_rst_n
+set_location_assignment PIN_D8 -to eth_rx_data_r[1]
+set_location_assignment PIN_A4 -to eth_rx_data_r[0]
+set_location_assignment PIN_D3 -to eth_rxdv_r
+set_location_assignment PIN_D6 -to eth_tx_data_r[1]
+set_location_assignment PIN_C8 -to eth_tx_data_r[0]
+set_location_assignment PIN_D5 -to eth_tx_en_r
+
+# RMII pin registers inside the I/O cells -> pin timing no longer changes from one place-and-route to the next
+set_instance_assignment -name FAST_INPUT_REGISTER ON -to eth_rxdv_r
+set_instance_assignment -name FAST_INPUT_REGISTER ON -to eth_rx_data_r[0]
+set_instance_assignment -name FAST_INPUT_REGISTER ON -to eth_rx_data_r[1]
+set_instance_assignment -name FAST_OUTPUT_REGISTER ON -to eth_tx_en_r
+set_instance_assignment -name FAST_OUTPUT_REGISTER ON -to eth_tx_data_r[0]
+set_instance_assignment -name FAST_OUTPUT_REGISTER ON -to eth_tx_data_r[1]
+
+set_global_assignment -name SEARCH_PATH ../rtl
+set_global_assignment -name VERILOG_FILE ../../ethernet/rtl/eth_udp_mii/ip_send.v
+set_global_assignment -name VERILOG_FILE ../../ethernet/rtl/eth_udp_mii/ip_receive.v
+set_global_assignment -name VERILOG_FILE ../../ethernet/rtl/eth_udp_mii/eth_udp_mii.v
+set_global_assignment -name VERILOG_FILE ../../ethernet/rtl/eth_udp_mii/crc32_d4.v
+set_global_assignment -name VERILOG_FILE ../../ethernet/rtl/eth_udp_rmii/rmii_to_mii.v
+set_global_assignment -name VERILOG_FILE ../../ethernet/rtl/eth_udp_rmii/mii_to_rmii.v
+set_global_assignment -name VERILOG_FILE ../../common/rx_fifo.v
+set_global_assignment -name VERILOG_FILE ../rtl/hth_txbuf.v
+set_global_assignment -name VERILOG_FILE ../rtl/hth_engine.v
+set_global_assignment -name VERILOG_FILE ../rtl/lio_hth_top.v
+set_global_assignment -name SDC_FILE lio_hth.sdc

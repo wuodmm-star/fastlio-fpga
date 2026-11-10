@@ -1,0 +1,312 @@
+diff -ru a/eth_udp_mii/eth_udp_mii.v b/eth_udp_mii/eth_udp_mii.v
+--- a/eth_udp_mii/eth_udp_mii.v	2026-11-10 12:39:08.880182354 +0900
++++ b/eth_udp_mii/eth_udp_mii.v	2026-11-10 12:39:08.884182433 +0900
+@@ -21,10 +21,8 @@
+ #(
+     parameter   BOARD_MAC   = 48'hFF_FF_FF_FF_FF_FF ,   //板卡MAC地址
+     parameter   BOARD_IP    = 32'hFF_FF_FF_FF       ,   //板卡IP地址
+-    parameter   BOARD_PORT  = 16'd1234              ,   //板卡端口号
+-    parameter   PC_MAC      = 48'hFF_FF_FF_FF_FF_FF ,   //PC机MAC地址
+-    parameter   PC_IP       = 32'hFF_FF_FF_FF       ,   //PC机IP地址
+-    parameter   PC_PORT     = 16'd1234                  //PC机端口号
++    parameter   BOARD_PORT  = 16'd1234                  //板卡端口号
++    // PC_MAC / PC_IP / PC_PORT removed 2026-11-09: the board now replies to whoever sent the packet
+ )
+ (
+     input   wire            eth_rx_clk      ,   //mii时钟,接收
+@@ -44,7 +42,8 @@
+     output  wire    [15:0]  rec_data_num    ,   //接收有效数据字节数
+     output  wire            eth_tx_en       ,   //输出数据有效信号(mii)
+     output  wire    [3:0]   eth_tx_data     ,   //输出数据(mii)
+-    output  wire            eth_rst_n           //复位信号,低电平有效
++    output  wire            eth_rst_n       ,   //复位信号,低电平有效
++    output  wire            sfd_ok              //diagnostic: preamble+SFD found (one pulse per frame)
+ );
+ 
+ //********************************************************************//
+@@ -55,6 +54,11 @@
+ wire            crc_clr ;   //CRC数据复位信号
+ wire    [31:0]  crc_data;   //CRC校验数据
+ wire    [31:0]  crc_next;   //CRC下次校验完成数据
++// reply address learned from the last accepted packet (added 2026-11-09).
++// rx and tx run on the same 25 MHz clock in this design, so no clock-domain crossing is needed.
++wire    [47:0]  src_mac ;
++wire    [31:0]  src_ip  ;
++wire    [15:0]  src_port;
+ 
+ //********************************************************************//
+ //***************************** Main Code ****************************//
+@@ -81,7 +85,11 @@
+     .rec_end        (rec_end        ),  //数据接收使能信号
+     .rec_data_en    (rec_en         ),  //接收数据
+     .rec_data       (rec_data       ),  //数据包接收完成信号
+-    .rec_data_num   (rec_data_num   )   //接收数据字节数
++    .rec_data_num   (rec_data_num   ),  //接收数据字节数
++    .src_mac        (src_mac        ),  //寄信人MAC
++    .src_ip         (src_ip         ),  //寄信人IP
++    .src_port       (src_port       ),  //寄信人端口
++    .sfd_ok         (sfd_ok         )
+ );
+ 
+ //------------ ip_send_inst -------------
+@@ -89,10 +97,7 @@
+ #(
+     .BOARD_MAC      (BOARD_MAC      ),  //板卡MAC地址
+     .BOARD_IP       (BOARD_IP       ),  //板卡IP地址
+-    .BOARD_PORT     (BOARD_PORT     ),  //板卡端口号
+-    .PC_MAC         (PC_MAC         ),  //PC机MAC地址
+-    .PC_IP          (PC_IP          ),  //PC机IP地址
+-    .PC_PORT        (PC_PORT        )   //PC机端口号
++    .BOARD_PORT     (BOARD_PORT     )   //板卡端口号
+ )
+ ip_send_inst
+ (
+@@ -101,6 +106,9 @@
+     .send_en        (send_en        ),  //数据发送开始信号
+     .send_data      (send_data      ),  //发送数据
+     .send_data_num  (send_data_num  ),  //发送数据有效字节数
++    .dst_mac        (src_mac        ),  //回信给寄信人
++    .dst_ip         (src_ip         ),
++    .dst_port       (src_port       ),
+     .crc_data       (crc_data       ),  //CRC校验数据
+     .crc_next       (crc_next[31:28]),  //CRC下次校验完成数据
+ 
+diff -ru a/eth_udp_mii/ip_receive.v b/eth_udp_mii/ip_receive.v
+--- a/eth_udp_mii/ip_receive.v	2026-11-10 12:39:08.880182354 +0900
++++ b/eth_udp_mii/ip_receive.v	2026-11-10 12:39:08.885182453 +0900
+@@ -31,7 +31,12 @@
+     output  reg             rec_data_en ,   //数据接收使能信号
+     output  reg     [31:0]  rec_data    ,   //接收数据
+     output  reg             rec_end     ,   //数据包接收完成信号
+-    output  reg     [15:0]  rec_data_num    //接收数据字节数
++    output  reg     [15:0]  rec_data_num,   //接收数据字节数
++    // ---- added 2026-11-09: who sent the last accepted packet (so we can reply to the sender) ----
++    output  reg     [47:0]  src_mac     ,   //寄信人MAC地址
++    output  reg     [31:0]  src_ip      ,   //寄信人IP地址
++    output  reg     [15:0]  src_port    ,   //寄信人UDP端口
++    output  wire            sfd_ok          //diagnostic (2026-11-10): one pulse per frame whose preamble+SFD were found
+ );
+ 
+ //********************************************************************//
+@@ -68,6 +73,10 @@
+ reg     [15:0]  udp_len         ;   //UDP部分字节长度
+ reg     [15:0]  cnt_data        ;   //接收数据字节计数器
+ reg     [1:0]   cnt_rec_data    ;   //数据计数器,单位4字节
++reg     [7:0]   ip_flags_hi     ;   //IP首部第6字节: 标志位(含MF) + 片偏移高5位   (added 2026-11-09)
++reg     [7:0]   ip_flags_lo     ;   //IP首部第7字节: 片偏移低8位
++reg     [7:0]   ip_proto        ;   //IP首部第9字节: 协议号, UDP = 17
++wire            ip_hdr_ok       ;   //是UDP且不是分片
+ 
+ //********************************************************************//
+ //***************************** Main Code ****************************//
+@@ -116,6 +125,11 @@
+ always@(posedge sys_clk or negedge sys_rst_n)
+     if(sys_rst_n == 1'b0)
+         state   <=  IDLE;
++    // 2026-11-10: between frames always restart from IDLE. The original state machine kept its state across frames,
++    // so a foreign frame (e.g. a Windows broadcast) that ended half-way through a header left it mid-count and the
++    // next frame's preamble was mis-counted and dropped (seen as lost first packets after idle).
++    else    if(eth_rxdv_reg == 1'b0)
++        state   <=  IDLE;
+     else    case(state)
+         IDLE:
+             if(sw_en == 1'b1)
+@@ -175,7 +189,8 @@
+         sw_en   <=  1'b1;
+     else    if((state == IP_HEAD) && (data_en == 1'b1)
+         && (cnt_byte == ip_len - 1'b1)
+-        && (des_ip[23:0] == BOARD_IP[31:8]) && (data == BOARD_IP[7:0]))
++        && (des_ip[23:0] == BOARD_IP[31:8]) && (data == BOARD_IP[7:0])
++        && (ip_hdr_ok == 1'b1))
+         sw_en   <=  1'b1;
+     else    if((state == UDP_HEAD) && (data_en == 1'b1)
+         && (cnt_byte == 8'd7))
+@@ -212,6 +227,8 @@
+ always @(posedge sys_clk or negedge sys_rst_n)
+     if(sys_rst_n == 1'b0)
+         cnt_byte    <=  5'd0;
++    else    if(eth_rxdv_reg == 1'b0)                   // 2026-11-10: restart between frames
++        cnt_byte    <=  5'd0;
+     else    if((state == PACKET_HEAD) && (data_en == 1'b1))
+         if(cnt_byte == 5'd6)
+             cnt_byte <= 5'd0;
+@@ -265,8 +282,29 @@
+         des_ip  <=  {des_ip[23:0],data};
+ 
+ //ip_flag:IP地址正确标志
++// 2026-11-09: also require "UDP, not a fragment" (ip_hdr_ok). A fragmented datagram used to be
++// glued together with the next frame's header bytes and echoed back as garbage.
+ assign  ip_flag = ((des_ip[23:0] == BOARD_IP[31:8])
+-            && (data == BOARD_IP[7:0])) ? 1'b1 : 1'b0;
++            && (data == BOARD_IP[7:0]) && (ip_hdr_ok == 1'b1)) ? 1'b1 : 1'b0;
++//ip_flags_hi / ip_flags_lo / ip_proto: captured from the IP header (added 2026-11-09)
++always@(posedge sys_clk or negedge sys_rst_n)
++    if(sys_rst_n == 1'b0)
++        begin
++            ip_flags_hi <=  8'd0;
++            ip_flags_lo <=  8'd0;
++            ip_proto    <=  8'd0;
++        end
++    else    if((state == IP_HEAD) && (data_en == 1'b1))
++        begin
++            if(cnt_byte == 5'd6)    ip_flags_hi <=  data;
++            if(cnt_byte == 5'd7)    ip_flags_lo <=  data;
++            if(cnt_byte == 5'd9)    ip_proto    <=  data;
++        end
++
++//ip_hdr_ok: UDP (17), MF flag clear, fragment offset zero
++assign  ip_hdr_ok = (ip_proto == 8'd17) && (ip_flags_hi[5] == 1'b0)
++                    && ({ip_flags_hi[4:0],ip_flags_lo} == 13'd0);
++
+ //ip_len:IP首部字节长度
+ always@(posedge sys_clk or negedge sys_rst_n)
+     if(sys_rst_n == 1'b0)
+@@ -290,6 +328,8 @@
+ always@(posedge sys_clk or negedge sys_rst_n)
+     if(sys_rst_n == 1'b0)
+         cnt_data    <=  16'd0;
++    else    if(eth_rxdv_reg == 1'b0)                   // 2026-11-10: restart between frames
++        cnt_data    <=  16'd0;
+     else    if((state == REC_DATA) && (data_en == 1'b1))
+         if(cnt_data == (data_len - 1'b1))
+             cnt_data    <=  16'd0;
+@@ -336,6 +376,8 @@
+ always@(posedge sys_clk or negedge sys_rst_n)
+     if(sys_rst_n == 1'b0)
+         cnt_rec_data    <=  2'd0;
++    else    if(eth_rxdv_reg == 1'b0)                   // 2026-11-10: restart between frames
++        cnt_rec_data    <=  2'd0;
+     else    if((state == REC_DATA) && (data_en == 1'b1))
+         if(cnt_data == (data_len - 1'b1))
+             cnt_rec_data    <=  2'd0;
+@@ -352,4 +394,54 @@
+     else
+         rec_end     <=  1'b0;
+ 
++//********************************************************************//
++//**** added 2026-11-09: remember the sender (reply-to-sender) *******//
++//********************************************************************//
++// While a packet arrives we copy the sender's MAC (Ethernet bytes 6..11),
++// IP (IP header bytes 12..15) and UDP port (UDP header bytes 0..1) into
++// shadow registers. They are copied to the outputs only after the MAC and IP
++// filters have passed (end of UDP header), so a packet meant for somebody
++// else can never change the reply address.
++reg     [47:0]  cap_mac ;
++reg     [31:0]  cap_ip  ;
++reg     [15:0]  cap_port;
++
++always@(posedge sys_clk or negedge sys_rst_n)
++    if(sys_rst_n == 1'b0)
++        cap_mac <=  48'h0;
++    else    if((state == ETH_HEAD) && (data_en == 1'b1)
++            && (cnt_byte >= 5'd6) && (cnt_byte <= 5'd11))
++        cap_mac <=  {cap_mac[39:0],data};
++
++always@(posedge sys_clk or negedge sys_rst_n)
++    if(sys_rst_n == 1'b0)
++        cap_ip  <=  32'h0;
++    else    if((state == IP_HEAD) && (data_en == 1'b1)
++            && (cnt_byte >= 5'd12) && (cnt_byte <= 5'd15))
++        cap_ip  <=  {cap_ip[23:0],data};
++
++always@(posedge sys_clk or negedge sys_rst_n)
++    if(sys_rst_n == 1'b0)
++        cap_port    <=  16'h0;
++    else    if((state == UDP_HEAD) && (data_en == 1'b1)
++            && (cnt_byte <= 5'd1))
++        cap_port    <=  {cap_port[7:0],data};
++
++assign  sfd_ok = (state == PACKET_HEAD) && (sw_en == 1'b1);
++
++//commit when the UDP header is complete (MAC and IP checks already passed)
++always@(posedge sys_clk or negedge sys_rst_n)
++    if(sys_rst_n == 1'b0)
++        begin
++            src_mac     <=  48'h0;
++            src_ip      <=  32'h0;
++            src_port    <=  16'h0;
++        end
++    else    if((state == UDP_HEAD) && (sw_en == 1'b1))
++        begin
++            src_mac     <=  cap_mac ;
++            src_ip      <=  cap_ip  ;
++            src_port    <=  cap_port;
++        end
++
+ endmodule
+diff -ru a/eth_udp_mii/ip_send.v b/eth_udp_mii/ip_send.v
+--- a/eth_udp_mii/ip_send.v	2026-11-10 12:39:08.880182354 +0900
++++ b/eth_udp_mii/ip_send.v	2026-11-10 12:39:08.887182493 +0900
+@@ -21,10 +21,7 @@
+ #(
+     parameter   BOARD_MAC   = 48'hFF_FF_FF_FF_FF_FF ,   //板卡MAC地址
+     parameter   BOARD_IP    = 32'hFF_FF_FF_FF       ,   //板卡IP地址
+-    parameter   BOARD_PORT  = 16'd1234              ,   //板卡端口号
+-    parameter   PC_MAC      = 48'hFF_FF_FF_FF_FF_FF ,   //PC机MAC地址
+-    parameter   PC_IP       = 32'hFF_FF_FF_FF       ,   //PC机IP地址
+-    parameter   PC_PORT     = 16'd1234                  //PC机端口号
++    parameter   BOARD_PORT  = 16'd1234                  //板卡端口号
+ )
+ (
+     input   wire            sys_clk         ,   //时钟信号
+@@ -32,6 +29,10 @@
+     input   wire            send_en         ,   //数据发送开始信号
+     input   wire    [31:0]  send_data       ,   //发送数据
+     input   wire    [15:0]  send_data_num   ,   //发送数据有效字节数
++    // ---- added 2026-11-09: reply address = sender of the last packet ----
++    input   wire    [47:0]  dst_mac         ,   //收信人MAC地址
++    input   wire    [31:0]  dst_ip          ,   //收信人IP地址
++    input   wire    [15:0]  dst_port        ,   //收信人UDP端口
+     input   wire    [31:0]  crc_data        ,   //CRC校验数据
+     input   wire    [3:0]   crc_next        ,   //CRC下次校验完成数据
+ 
+@@ -72,6 +73,7 @@
+ reg     [15:0]  udp_len         ;   //UDP字节数
+ reg     [6:0]   state           ;   //状态机状态变量
+ reg             sw_en           ;   //状态跳转标志信号
++reg     [47:0]  dst_mac_l       ;   //收信人MAC地址(每包开始时锁存) added 2026-11-09
+ reg     [4:0]   cnt             ;   //数据计数器
+ reg     [2:0]   cnt_send_bit    ;   //发送数据比特计数器
+ reg     [15:0]  data_cnt        ;   //发送有效数据个数计数器
+@@ -138,12 +140,12 @@
+         end
+     else
+         begin
+-            eth_head[0]     <=  PC_MAC[47:40]   ;
+-            eth_head[1]     <=  PC_MAC[39:32]   ;
+-            eth_head[2]     <=  PC_MAC[31:24]   ;
+-            eth_head[3]     <=  PC_MAC[23:16]   ;
+-            eth_head[4]     <=  PC_MAC[15:8]    ;
+-            eth_head[5]     <=  PC_MAC[7:0]     ;
++            eth_head[0]     <=  dst_mac_l[47:40];
++            eth_head[1]     <=  dst_mac_l[39:32];
++            eth_head[2]     <=  dst_mac_l[31:24];
++            eth_head[3]     <=  dst_mac_l[23:16];
++            eth_head[4]     <=  dst_mac_l[15:8];
++            eth_head[5]     <=  dst_mac_l[7:0];
+             eth_head[6]     <=  BOARD_MAC[47:40];
+             eth_head[7]     <=  BOARD_MAC[39:32];
+             eth_head[8]     <=  BOARD_MAC[31:24];
+@@ -165,13 +167,20 @@
+             ip_udp_head[1][15:0] <= 16'h4000;
+             ip_udp_head[2] <= {8'h40,8'd17,16'h0};
+             ip_udp_head[3] <= BOARD_IP;
+-            ip_udp_head[4] <= PC_IP;
+-            ip_udp_head[5] <= {BOARD_PORT,PC_PORT};
++            ip_udp_head[4] <= dst_ip;
++            ip_udp_head[5] <= {BOARD_PORT,dst_port};
+             ip_udp_head[6] <= {udp_len,16'h0000};
+         end
+     else    if((state == CHECK_SUM) && (cnt == 5'd3))
+         ip_udp_head[2][15:0] <= ~check_sum[15:0];
+ 
++//dst_mac_l: reply MAC latched at the start of each packet (added 2026-11-09)
++always @(posedge sys_clk or negedge sys_rst_n)
++    if(sys_rst_n == 1'b0)
++        dst_mac_l   <=  48'h0;
++    else    if((state == IDLE) && (sw_en == 1'b1))
++        dst_mac_l   <=  dst_mac;
++
+ //check_sum:IP首部check_sum校验
+ always @(posedge sys_clk or negedge sys_rst_n)
+     if(sys_rst_n == 1'b0)

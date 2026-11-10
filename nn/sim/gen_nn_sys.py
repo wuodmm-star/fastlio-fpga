@@ -1,0 +1,40 @@
+"""Whole-chip stimulus: ops -> UDP request frames (<= 72 ops, <= 18 searches each) + expected reply payloads."""
+import os, random, struct, sys
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "model")); sys.path.insert(0, os.path.join(HERE, "..", "..", "common"))
+import nn_model as N
+from frames import build
+PC_MAC, PC_IP, PC_PORT = bytes.fromhex("02005e000001"), bytes([192, 168, 137, 1]), 51000
+random.seed(9); M = N.Map(); ops = []
+for i in range(int(sys.argv[1]) if len(sys.argv) > 1 else 600):
+    p = tuple(random.randint(-2 << 16, 2 << 16) + c for c in (7 << 16, -3 << 16, 1 << 15))
+    r = random.random()
+    ops.append((0, 0, p) if r < 0.45 else (0, 1, p) if r < 0.6 else (1, 0, p))
+pkts, exp, cur = [], [], []
+def flush():
+    global M
+    if not cur: return
+    body = b"".join(struct.pack(">I", (ds << 1) | s) + struct.pack(">3i", *p) for s, ds, p in cur)
+    pkts.append(struct.pack(">I", 0xA5110000 | len(cur)) + body)
+    res = []
+    for s, ds, p in cur:
+        if s:
+            r = M.search(p); w = [len(r)]
+            for k in range(5):
+                w += list(r[k][1]) if k < len(r) else [0, 0, 0]
+            res.append(struct.pack(">16I", *[x & 0xFFFFFFFF for x in w]))
+        else:
+            M.add(p, ds)
+    exp.append(struct.pack(">I", 0xA5120000 | len(res)) + b"".join(res)); cur.clear()
+for i, o in enumerate(ops):
+    if i == len(ops) // 2 and len(sys.argv) > 2:                      # CLEAR in the middle: board and golden model both start over
+        flush()
+        pkts.append(struct.pack(">I", 0xA5130000)); exp.append(struct.pack(">I", 0xA5120000)); M = N.Map()
+    cur.append(o)
+    if len(cur) == 72 or sum(x[0] for x in cur) == 18 or random.random() < 0.08: flush()
+flush()
+frames = [build(PC_MAC, PC_IP, PC_PORT, p, ident=k + 1) for k, p in enumerate(pkts)]
+open(os.path.join(HERE, "sys_stim.mem"), "w").writelines(f"{b:02x}\n" for fr in frames for b in fr)
+open(os.path.join(HERE, "sys_lens.mem"), "w").writelines(f"{len(fr):04x}\n" for fr in frames)
+open(os.path.join(HERE, "sys_expect.txt"), "w").writelines(e.hex() + "\n" for e in exp)
+print(f"{len(ops)} ops in {len(frames)} packets, {sum(o[0] for o in ops)} searches")
