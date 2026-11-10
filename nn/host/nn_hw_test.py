@@ -1,5 +1,7 @@
 """Hardware test of the FPGA voxel map / nearest-neighbour search.
-  python nn_hw_test.py <ops.mem> <expect.txt>      (files produced for the simulations: 5 hex words per op line)
+  python nn_hw_test.py <ops.mem> <expect.txt> [cfg]   (files produced for the simulations: 5 hex words per op line)
+cfg = the CFG number printed by the stimulus generator: (gbits << 12) | keep_in_voxels, default 0 = 2^16 groups, never
+forget. The map is cleared (CLEAR command with cfg) before the test; the board's own counters are read at the end.
 Packets: <= 72 ops and <= 18 searches each; every packet gets a reply; stop-and-wait.
 """
 import socket, struct, sys, time
@@ -13,6 +15,10 @@ def main():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.bind(("0.0.0.0", 0)); s.settimeout(1.0)
     got, pk, nsr, lost = [], [], 0, 0
+    cfg = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+    s.sendto(struct.pack(">I", 0xA5130000 | cfg), BOARD)
+    data, _ = s.recvfrom(4096)
+    assert struct.unpack(">I", data[:4])[0] == 0xA5120000, "bad reply to CLEAR"
     t_search = 0.0
     t0 = time.perf_counter()
 
@@ -43,6 +49,10 @@ def main():
             flush()
     flush()
     dt = time.perf_counter() - t0
+    s.sendto(struct.pack(">I", 0xA5140000), BOARD)
+    data, _ = s.recvfrom(4096)
+    _, dropped, forgotten = struct.unpack(">3I", data[:12])
+    print(f"board counters: dropped adds {dropped}, forgotten voxels {forgotten}")
     bad = sum(a != b for a, b in zip(exp, got))
     print(f"{len(ops)} ops, {len(exp)} searches expected, {len(got)} results, {bad} mismatching, {lost} lost packets")
     for k, (a, b) in enumerate(zip(exp, got)):

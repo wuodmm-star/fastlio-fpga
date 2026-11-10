@@ -111,3 +111,34 @@ unchanged (same slot allocation and drop rule). Old core kept as rtl/nn_core_v1.
   (v1: 18.9 us) -> ~75 ms per scan for the searches, ~77 ms with the adds (10 Hz LiDAR budget: 100 ms).
   **ATE 11.40 cm** (max 34.7 cm). With 4 packets in flight v2 gave no gain (20.2 us): the bottleneck had moved to
   the per-packet cost of the WSL -> Windows -> board path.
+
+## Forgetting far-away voxels (2026-11-10)
+Problem: the table only grew; a full group dropped every new voxel that hashed into it.
+Rule (model/nn_model.py == voxmap.hpp MapFx == rtl/nn_core.v): when a new voxel finds all 8 slots of its group
+taken, the 8 tags are read and the slot whose voxel is farthest from the new one (Chebyshev distance in voxels,
+lowest slot on ties) is reused if that distance is > keep; otherwise the add is dropped. keep = 0: never forget.
+CLEAR now carries the configuration: 0xA513 | {gbits (0 = 16), keep[11:0] in voxels}; new command 0xA514 returns the
+board's counters (dropped adds, forgotten voxels). Client: FPGA_NN_KEEP (metres, default 200), FPGA_NN_GBITS.
+- core: 5 new states (read tag -> |diff| -> max -> compare -> select), group index masked with 2^gbits - 1
+- simulation, bit-exact: old synthetic 2110/2110 (forgetting off); forgetting stress (16 groups, keep 3 m) 3153/3153
+  with 4182 forgotten / 237 dropped; real FAST-LIO ops (512 groups, keep 60 m) 500/500 with 3917 / 1977;
+  whole chip 137/137 replies incl. the statistics reply. Negative control (board side keep = 0): FAIL as expected.
+- Python golden == FAST-LIO C++ MapFx on a whole run with 2^14 groups, keep 60 m: 1,037,766 adds,
+  11,965,432 searches, 0 mismatches (60,151 forgotten, 19,085 dropped)
+- Quartus: 7,456 LE (72 %), 24 multipliers, worst setup slack +0.126 ns at 100 MHz
+- hardware: the four tests above bit-exact, board counters equal to the golden model; negative control fails.
+  CLEAR between tests is enough (no reprogramming).
+- FAST-LIO, software (eee_03): the 128 m path is too short for the map size to matter for accuracy
+  | table | keep | forgotten | dropped adds | ATE |
+  |---|---|---|---|---|
+  | 4 MB (2^14) | off | 0 | 105,158 | 11.41 cm |
+  | 4 MB | 60 m | 60,124 | 18,954 | 11.45 cm |
+  | 2 MB (2^13) | off | 0 | 680,666 | 11.42 cm |
+  | 2 MB | 60 m | 288,027 | 194,151 | 11.39 cm |
+- FAST-LIO closed loop on the board (WSL2 -> board, 1810 scans, 0 reply timeouts):
+  | table | keep | forgotten (board) | dropped (board) | per search incl. network | ATE |
+  |---|---|---|---|---|---|
+  | 4 MB | 60 m | 62,818 | 21,316 | 11.28 us | 11.36 cm |
+  | 16 MB | 200 m | 0 | 24 | 11.30 us | 11.42 cm |
+  Forgetting cuts the dropped adds about 5x on a deliberately small table and costs no search time or accuracy;
+  showing an accuracy benefit needs a longer dataset than eee_03.

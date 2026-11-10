@@ -4,6 +4,8 @@
 //
 // Request payload : 0xA5 | 0x11 | count, then count ops x 4 words: {.., ds, search}, x, y, z  (Q16.16)
 //                   (client limit: <= 72 ops and <= 18 searches per packet, so the reply fits one datagram)
+//                   0xA5 | 0x13 | cfg : clear the map; cfg = {gbits (0 = 16), keep[11:0] in voxels} -> empty reply
+//                   0xA5 | 0x14       : statistics -> reply 0xA5120000, dropped adds, forgotten voxels
 // Reply payload   : 0xA5 | 0x12 | number of searches, then per search 16 words: found, 5 x (x, y, z)
 //                   (unused entries are 0). Every request gets a reply, so the client knows it was processed.
 // Replies are built in one half of a 2 x 512-word transmit buffer while the Ethernet side may still be sending
@@ -32,16 +34,20 @@ module nn_engine
     output  reg             op_ds,
     output  reg     [31:0]  op_x, op_y, op_z,
     output  reg             clr_req,
+    output  reg     [15:0]  clr_cfg,
+    input   wire    [31:0]  drop_cnt,
+    input   wire    [31:0]  evict_cnt,
     input   wire            res_valid,
     input   wire    [2:0]   res_found,
     input   wire    [479:0] res_pts
 );
 
 localparam  S_HDR = 4'd0, S_OPW = 4'd1, S_ISSUE = 4'd2, S_WAITC = 4'd3, S_RES = 4'd4, S_FIN = 4'd5, S_SEND = 4'd6,
-            S_CLRW = 4'd7, S_CLRX = 4'd8;
+            S_CLRW = 4'd7, S_CLRX = 4'd8, S_ST0 = 4'd9, S_ST1 = 4'd10;
 
 reg     [3:0]   st;
 reg     [1:0]   clr_dly;
+reg             stat;                       // the reply being built is a statistics reply (2 extra words)
 reg     [15:0]  nops, ns;
 reg     [1:0]   w;
 reg     [31:0]  opw0;
@@ -76,7 +82,7 @@ always @(posedge clk or negedge rst_n)
         rp <= 3'd0; rc <= 2'd0;
         tx_we <= 1'b0; tx_addr <= 0; tx_wdata <= 0; result_tgl <= 1'b0; reply_bytes <= 16'd4; bad_hdr_cnt <= 0;
         op_valid <= 1'b0; op_search <= 1'b0; op_ds <= 1'b0; op_x <= 0; op_y <= 0; op_z <= 0;
-ann_cnt <= 8'd0; sent_cnt <= 8'd0; sent_d <= 1'b0; clr_req <= 1'b0; clr_dly <= 2'd0;
+ann_cnt <= 8'd0; sent_cnt <= 8'd0; sent_d <= 1'b0; clr_req <= 1'b0; clr_dly <= 2'd0; clr_cfg <= 16'd0; stat <= 1'b0;
     end else begin
         tx_we <= 1'b0; op_valid <= 1'b0; clr_req <= 1'b0;
         sent_d <= sent_tgl;
@@ -86,7 +92,9 @@ ann_cnt <= 8'd0; sent_cnt <= 8'd0; sent_d <= 1'b0; clr_req <= 1'b0; clr_dly <= 2
         S_HDR:
             if (word_valid) begin
                 if (fifo_q[31:16] == 16'hA513) begin            // CLEAR: empty the map, then an empty reply
-                    ns <= 16'd0; st <= S_CLRW;
+                    ns <= 16'd0; clr_cfg <= fifo_q[15:0]; st <= S_CLRW;
+                end else if (fifo_q[31:16] == 16'hA514) begin   // statistics
+                    ns <= 16'd0; stat <= 1'b1; st <= S_ST0;
                 end else if (fifo_q[31:16] == 16'hA511) begin
                     nops <= fifo_q[15:0]; ns <= 0; w <= 0;
                     st <= (fifo_q[15:0] == 16'd0) ? S_FIN : S_OPW;
@@ -131,13 +139,15 @@ ann_cnt <= 8'd0; sent_cnt <= 8'd0; sent_d <= 1'b0; clr_req <= 1'b0; clr_dly <= 2
             st <= S_SEND;
         end
         S_SEND: begin                                    // announce one clock after the last write
-            reply_bytes <= 16'd4 + {ns[9:0], 6'd0};
+            reply_bytes <= stat ? 16'd12 : (16'd4 + {ns[9:0], 6'd0}); stat <= 1'b0;
             result_tgl <= ~result_tgl; cur_buf <= ~cur_buf; ann_cnt <= ann_cnt + 8'd1;
             st <= S_HDR;
         end
         S_CLRW: if (op_ready) begin clr_req <= 1'b1; clr_dly <= 2'd3; st <= S_CLRX; end
         S_CLRX: if (clr_dly != 2'd0) clr_dly <= clr_dly - 2'd1;        // let the core leave S_IDLE first
                 else if (op_ready) st <= S_FIN;
+        S_ST0: begin tx_we <= 1'b1; tx_addr <= {cur_buf, 9'd1}; tx_wdata <= drop_cnt;  st <= S_ST1; end
+        S_ST1: begin tx_we <= 1'b1; tx_addr <= {cur_buf, 9'd2}; tx_wdata <= evict_cnt; st <= S_FIN; end
         default: st <= S_HDR;
         endcase
     end

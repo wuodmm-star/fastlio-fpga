@@ -1,12 +1,15 @@
 """Golden model of the FPGA voxel-hash map + 5-nearest-neighbour search (same rules as MapFx in voxmap.hpp).
 
   coordinates : int32 Q16.16 metres;  voxel index = coord >> 15  (0.5 m)
-  table       : 2^16 groups x 8 slots; group = bits 8..23 of (uint32)(x + 1021 y + 262147 z) * 2654435761;
-                a voxel takes the first free slot of its group (tag = voxel index), dropped if the group is full
+  table       : 2^gbits groups x 8 slots (gbits = 16 on the board by default);
+                group = bits 8..(8+gbits-1) of (uint32)(x + 1021 y + 262147 z) * 2654435761;
+                a voxel takes the first free slot of its group (tag = voxel index). If the group is full, the slot
+                whose voxel is farthest from the new one (Chebyshev, in voxels; lowest slot on ties) is reused when
+                that distance is > keep (keep = 0: never); otherwise the add is dropped.
   add(p, ds)  : ds=1 -> voxel keeps only the point closest to its centre; ds=0 -> append, or replace the farthest
   search(q)   : 27 voxels around q (dx, dy, dz = -1..1, dz fastest), K=5 nearest, a later point wins only if
                 strictly closer
-python nn_model.py replay <dump>   replays a FAST-LIO FPGA_NN_DUMP and checks every search result
+python nn_model.py replay <dump> [gbits keep]   replays a FAST-LIO FPGA_NN_DUMP and checks every search result
 """
 import struct
 import sys
@@ -14,9 +17,9 @@ import sys
 NGROUP, WAYS, CAP, K = 1 << 16, 8, 4, 5
 
 
-def group(v):
+def group(v, gbits=16):
     s = (v[0] + v[1] * 1021 + v[2] * 262147) & 0xFFFFFFFF
-    return (((s * 2654435761) & 0xFFFFFFFF) >> 8) & (NGROUP - 1)
+    return (((s * 2654435761) & 0xFFFFFFFF) >> 8) & ((1 << gbits) - 1)
 
 
 def dc2(p, v):
@@ -24,13 +27,15 @@ def dc2(p, v):
 
 
 class Map:
-    def __init__(self):
+    def __init__(self, gbits=16, keep=0):
         self.tag = {}      # slot -> voxel tuple
         self.pts = {}      # slot -> list of points
         self.dropped = 0
+        self.evicted = 0
+        self.gbits, self.keep = gbits, keep
 
     def find(self, v, create):
-        g = group(v) * WAYS
+        g = group(v, self.gbits) * WAYS
         for k in range(WAYS):
             s = g + k
             if s in self.tag and self.tag[s] == v:
@@ -42,6 +47,19 @@ class Map:
             if s not in self.tag:
                 self.tag[s] = v
                 self.pts[s] = []
+                return s
+        if self.keep:
+            far, fd = 0, -1
+            for k in range(WAYS):
+                t = self.tag[g + k]
+                d = max(abs(t[0] - v[0]), abs(t[1] - v[1]), abs(t[2] - v[2]))
+                if d > fd:
+                    far, fd = k, d
+            if fd > self.keep:
+                s = g + far
+                self.tag[s] = v
+                self.pts[s] = []
+                self.evicted += 1
                 return s
         self.dropped += 1
         return None
@@ -114,7 +132,7 @@ def read_dump(path):
 
 
 if __name__ == "__main__" and sys.argv[1] == "replay":
-    M = Map(); n_add = n_s = bad = 0
+    M = Map(*(int(a) for a in sys.argv[3:5])); n_add = n_s = bad = 0
     for rec in read_dump(sys.argv[2]):
         if rec[0] == "add":
             M.add(rec[2], rec[1]); n_add += 1
@@ -126,4 +144,4 @@ if __name__ == "__main__" and sys.argv[1] == "replay":
                 bad += 1
                 if bad <= 3:
                     print("mismatch", rec[1], got, rec[2])
-    print(f"{n_add} adds, {n_s} searches, {bad} mismatches vs FAST-LIO's MapFx, voxels {len(M.tag)}, dropped {M.dropped}")
+    print(f"{n_add} adds, {n_s} searches, {bad} mismatches vs FAST-LIO's MapFx, voxels {len(M.tag)}, forgotten {M.evicted}, dropped {M.dropped}")

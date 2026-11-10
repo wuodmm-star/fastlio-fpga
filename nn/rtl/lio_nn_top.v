@@ -106,7 +106,8 @@ wire    [9:0]   tx_addr;
 wire    [31:0]  tx_wdata;
 wire   [15:0]   bad_hdr_cnt;
 wire            op_ready, op_valid, op_search, op_ds, res_valid, clr_req;
-wire   [31:0]   op_x, op_y, op_z, drop_cnt;
+wire   [31:0]   op_x, op_y, op_z, drop_cnt, evict_cnt;
+wire   [15:0]   clr_cfg;
 wire    [2:0]   res_found;
 wire  [479:0]   res_pts;
 
@@ -115,7 +116,7 @@ nn_engine nn_engine_inst (.clk (clk100), .rst_n (rst100_n),
     .tx_we (tx_we), .tx_addr (tx_addr), .tx_wdata (tx_wdata), .result_tgl (result_tgl), .reply_bytes (reply_bytes),
     .sent_tgl (sent_sync[1]), .bad_hdr_cnt (bad_hdr_cnt),
     .op_ready (op_ready), .op_valid (op_valid), .op_search (op_search), .op_ds (op_ds),
-    .op_x (op_x), .op_y (op_y), .op_z (op_z), .clr_req (clr_req),
+    .op_x (op_x), .op_y (op_y), .op_z (op_z), .clr_req (clr_req), .clr_cfg (clr_cfg), .drop_cnt (drop_cnt), .evict_cnt (evict_cnt),
     .res_valid (res_valid), .res_found (res_found), .res_pts (res_pts));
 
 wire            sd_init_done, sd_ready, sd_ack, sd_done, sd_req, sd_we, sd_wr_take, sd_rd_valid, sd_dq_oe;
@@ -128,7 +129,7 @@ nn_core #(.NCLR (NCLR)) nn_core_inst (.clk (clk100), .rst_n (rst100_n & sd_init_
     .op_valid (op_valid), .op_ready (op_ready), .op_search (op_search), .op_ds (op_ds),
     .op_x (op_x), .op_y (op_y), .op_z (op_z), .clr_req (clr_req),
     .res_valid (res_valid), .res_found (res_found), .res_pts (res_pts),
-    .drop_cnt (drop_cnt), .sd_ack (sd_ack), .sd_done (sd_done), .sd_req (sd_req), .sd_we (sd_we),
+    .clr_cfg (clr_cfg), .drop_cnt (drop_cnt), .evict_cnt (evict_cnt), .sd_ack (sd_ack), .sd_done (sd_done), .sd_req (sd_req), .sd_we (sd_we),
     .sd_addr (sd_addr), .sd_len (sd_len), .sd_wr_idx (sd_wr_idx), .sd_wr_data (sd_wr_data),
     .sd_rd_valid (sd_rd_valid), .sd_rd_data (sd_rd_data));
 

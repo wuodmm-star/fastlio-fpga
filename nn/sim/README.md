@@ -8,7 +8,9 @@ this folder. iverilog 12 compiles it as is.
 |---|---|---|
 | SDRAM controller | `iverilog -g2012 -DRDLAT=3 -o t.vvp tb_sdram.v mt48lc16m16a2.v ../rtl/sdram_rw.v && vvp -n t.vvp` | random burst writes/reads, refresh interleaving |
 | core, synthetic | `python3 gen_nn_synth.py 6000`, then `tb_nn.v` (see below), `python3 check_nn.py` | all add cases (append, closest-to-centre, replace-farthest) + 2110 searches |
-| core, real FAST-LIO ops | `python3 gen_nn_stim.py 400 10` (needs a FAST-LIO `FPGA_NN_DUMP` file named `nn.dump`) | recorded adds/searches |
+| core, real FAST-LIO ops | `python3 gen_nn_stim.py 400 10` (needs a FAST-LIO `FPGA_NN_DUMP` file named `nn.dump`; optional 3rd/4th argument: gbits, keep in voxels) | recorded adds/searches |
+| core, forgetting | `python3 gen_nn_forget.py 8000 4 6`, then `tb_nn.v` compiled with `-P tb_nn.CFG=16390` (the CFG number the generator prints) | small table, wandering sensor: 4182 voxels forgotten, 237 adds dropped, 3153 searches |
+| whole chip, forgetting | `python3 gen_nn_sys.py 1500 0 3 5`, `tb_nn_sys.v` with `+W=4` | CLEAR with configuration, forgetting, statistics reply |
 | whole chip | `python3 gen_nn_sys.py 600`, `tb_nn_sys.v` with `+W=4` | Ethernet frames in, reply frames out, 4 packets in flight |
 
     iverilog -g2012 -o t.vvp tb_nn.v mt48lc16m16a2.v ../rtl/sdram_rw.v ../rtl/nn_core.v && vvp -n t.vvp +N=$(wc -l < nn_ops.mem)

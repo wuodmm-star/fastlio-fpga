@@ -12,11 +12,16 @@
 //     slot k at word 8 + 15 k : tag x, tag y, tag z, then 4 points x 3 offsets
 //  A lookup reads the 6 summary words; only slots whose fingerprint matches are read (tag + points in one burst).
 //  v1 read all 8 slot headers (32 words) for every one of the 27 neighbour voxels.
+// Forgetting: when a new voxel finds all 8 slots of its group taken, the 8 tags are read and the slot whose voxel
+// is farthest from the new one (Chebyshev distance in voxels, lowest slot on ties) is reused if that distance is
+// > keep; otherwise the point is dropped (keep = 0: never forget). keep and the table size (2^gbits groups) come
+// with the CLEAR command: clr_cfg = {gbits (0 = 16), keep[11:0] in voxels}.
 // Clock: 100 MHz. One operation at a time.
 ////////////////////////////////////////////////////////////////////////
 module nn_core
 #(
-    parameter   NCLR = 65536                // groups cleared after reset (all of them on hardware)
+    parameter   NCLR = 65536,               // groups cleared after reset (all of them on hardware)
+    parameter   DEF_CFG = 16'h0000          // {gbits, keep} after reset (simulation); hardware sets it with CLEAR
 )
 (
     input   wire            clk,
@@ -27,10 +32,12 @@ module nn_core
     input   wire            op_ds,
     input   wire    [31:0]  op_x, op_y, op_z,
     input   wire            clr_req,
+    input   wire    [15:0]  clr_cfg,
     output  reg             res_valid,
     output  reg     [2:0]   res_found,
     output  reg     [479:0] res_pts,
     output  reg     [31:0]  drop_cnt,
+    output  reg     [31:0]  evict_cnt,
     input   wire            sd_ack,
     input   wire            sd_done,
     output  reg             sd_req,
@@ -48,7 +55,8 @@ localparam  S_IDLE = 5'd0, S_NB = 5'd1, S_HASH = 5'd2, S_HASH1 = 5'd3, S_HASH2 =
             S_SUMW = 5'd6, S_SUMDEC = 5'd7, S_CAND = 5'd8, S_SLOTW = 5'd9, S_TAGCHK = 5'd10, S_NOHIT = 5'd11,
             S_DIST0 = 5'd12, S_DIST1 = 5'd13, S_DIST2 = 5'd14, S_INS = 5'd15, S_NEXT = 5'd16, S_DONE = 5'd17,
             S_DC0 = 5'd18, S_DC1 = 5'd19, S_DC2 = 5'd20, S_DCSEL = 5'd21, S_ADDNEW = 5'd22, S_WR_P = 5'd23,
-            S_WR_S = 5'd24, S_CLR = 5'd25;
+            S_WR_S = 5'd24, S_CLR = 5'd25, S_EV_RD = 5'd26, S_EV_D0 = 5'd27, S_EV_D1 = 5'd28, S_EV_D2 = 5'd29,
+            S_EV_SEL = 5'd30;
 
 reg     [4:0]   st;
 reg             is_search, ds, busy;
@@ -78,6 +86,14 @@ reg     [35:0]  sqx, sqy, sqz;
 reg     [39:0]  d2;
 reg     [15:0]  wbuf [0:5];
 reg             new_slot;
+reg     [15:0]  gmask;                      // 2^gbits - 1
+reg     [11:0]  keep;                       // keep radius in voxels, 0 = never forget
+reg     [15:0]  eax, eay, eaz, emax, ev_fd; // |tag - v| per axis, their maximum, farthest so far
+reg     [2:0]   ev_far;
+
+function [15:0] gmask_of; input [3:0] b; begin gmask_of = (b == 4'd0) ? 16'hFFFF : ((16'd1 << b) - 16'd1); end endfunction
+function [15:0] absdiff; input [15:0] a; input [15:0] b; reg signed [16:0] d; begin
+    d = {a[15], a} - {b[15], b}; absdiff = d[16] ? -d : d; end endfunction
 
 assign  op_ready   = (st == S_IDLE);
 assign  sd_wr_data = wbuf[sd_wr_idx[2:0]];
@@ -137,6 +153,8 @@ always @(posedge clk or negedge rst_n)
         wpoint <= 0; px <= 0; py <= 0; pz <= 0; ddx <= 0; ddy <= 0; ddz <= 0; sqx <= 0; sqy <= 0; sqz <= 0; d2 <= 0;
         new_slot <= 1'b0; res_valid <= 1'b0; res_found <= 0; res_pts <= 0; drop_cnt <= 0;
         sd_req <= 1'b0; sd_we <= 1'b0; sd_addr <= 0; sd_len <= 0;
+        gmask <= gmask_of(DEF_CFG[15:12]); keep <= DEF_CFG[11:0]; evict_cnt <= 0;
+        eax <= 0; eay <= 0; eaz <= 0; emax <= 0; ev_fd <= 0; ev_far <= 0;
     end else begin
         res_valid <= 1'b0;
         if (sd_ack) sd_req <= 1'b0;
@@ -157,7 +175,10 @@ always @(posedge clk or negedge rst_n)
                 end
             end else if (sd_done) begin busy <= 1'b0; clr_g <= clr_g + 17'd1; end
         S_IDLE:
-            if (clr_req) begin clr_g <= 17'd0; drop_cnt <= 32'd0; st <= S_CLR; end
+            if (clr_req) begin
+                clr_g <= 17'd0; drop_cnt <= 32'd0; evict_cnt <= 32'd0; st <= S_CLR;
+                gmask <= gmask_of(clr_cfg[15:12]); keep <= clr_cfg[11:0];
+            end
             else if (op_valid) begin
                 is_search <= op_search; ds <= op_ds; qx <= op_x; qy <= op_y; qz <= op_z;
                 found <= 3'd0; nb <= 5'd0;
@@ -170,7 +191,7 @@ always @(posedge clk or negedge rst_n)
             ncx <= {1'b0, qx[14:0]} - 16'sd16384; ncy <= {1'b0, qy[14:0]} - 16'sd16384; ncz <= {1'b0, qz[14:0]} - 16'sd16384;
         end
         S_HASH1: begin hs_r <= hs_ar + hs_br; st <= S_HASH2; end
-        S_HASH2: begin g <= hm[23:8]; fp <= hm[31:24]; dcn <= dc_new; st <= S_RDSUM; end
+        S_HASH2: begin g <= hm[23:8] & gmask; fp <= hm[31:24]; dcn <= dc_new; st <= S_RDSUM; end
         S_RDSUM: begin                                       // read the 6 summary words
             sd_req <= 1'b1; sd_we <= 1'b0; sd_addr <= g_base; sd_len <= 9'd6; rcnt <= 5'd0; st <= S_SUMW;
         end
@@ -203,8 +224,34 @@ always @(posedge clk or negedge rst_n)
             if (is_search) st <= S_NEXT;
             else if (empt != 8'd0) begin
                 slot <= lsb8(empt); n <= 3'd0; new_slot <= 1'b1; st <= S_ADDNEW;
+            end else if (keep != 12'd0) begin
+                c <= 3'd0; st <= S_EV_RD;                    // group full: look for a far-away voxel to forget
             end else begin
                 drop_cnt <= drop_cnt + 32'd1; st <= S_IDLE;  // group full: point dropped
+            end
+        //------------------------------------------------ FORGET: read the 8 tags, find the farthest voxel
+        S_EV_RD:
+            if (!busy) begin
+                sd_req <= 1'b1; sd_we <= 1'b0; sd_addr <= slot_base_c; sd_len <= 9'd3; rcnt <= 5'd0; busy <= 1'b1;
+            end else if (sd_done) begin busy <= 1'b0; st <= S_EV_D0; end
+        S_EV_D0: begin
+            eax <= absdiff(pb[0], vx[15:0]); eay <= absdiff(pb[1], vy[15:0]); eaz <= absdiff(pb[2], vz[15:0]);
+            st <= S_EV_D1;
+        end
+        S_EV_D1: begin
+            emax <= (eax >= eay) ? ((eax >= eaz) ? eax : eaz) : ((eay >= eaz) ? eay : eaz);
+            st <= S_EV_D2;
+        end
+        S_EV_D2: begin
+            if (c == 3'd0 || emax > ev_fd) begin ev_fd <= emax; ev_far <= c; end
+            if (c == 3'd7) st <= S_EV_SEL;
+            else begin c <= c + 3'd1; st <= S_EV_RD; end
+        end
+        S_EV_SEL:
+            if (ev_fd > {4'd0, keep}) begin                  // reuse that slot for the new voxel
+                slot <= ev_far; n <= 3'd0; new_slot <= 1'b1; evict_cnt <= evict_cnt + 32'd1; st <= S_ADDNEW;
+            end else begin
+                drop_cnt <= drop_cnt + 32'd1; st <= S_IDLE;
             end
         //------------------------------------------------ SEARCH
         S_DIST0: begin

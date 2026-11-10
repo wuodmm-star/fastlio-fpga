@@ -71,7 +71,7 @@ index 8c39e18..fff2d7a 100644
    <depend>livox_ros_driver2</depend>
  
 diff --git a/src/laserMapping.cpp b/src/laserMapping.cpp
-index e5d9950..4fc5e4c 100644
+index e5d9950..540fd91 100644
 --- a/src/laserMapping.cpp
 +++ b/src/laserMapping.cpp
 @@ -32,6 +32,8 @@
@@ -83,7 +83,7 @@ index e5d9950..4fc5e4c 100644
  #include <omp.h>
  #include <mutex>
  #include <math.h>
-@@ -480,6 +482,20 @@ void map_incremental()
+@@ -480,6 +482,23 @@ void map_incremental()
      double st_time = omp_get_wtime();
      add_point_size = ikdtree.Add_Points(PointToAdd, true);
      ikdtree.Add_Points(PointNoNeedDownsample, false); 
@@ -96,15 +96,18 @@ index e5d9950..4fc5e4c 100644
 +            auto &F = voxmap::fpga();
 +            fprintf(stderr, "[voxmap] scan %d: FPGA %ld adds (%.3f ms/scan), %ld searches (%.2f us each incl. network), %ld packets%s\n",
 +                    nscan, F.n_add, 1e3 * F.t_add / nscan, F.n_search, 1e6 * F.t_search / std::max(1L, F.n_search), F.n_pkt, F.ok ? "" : " [ERROR]");
++            uint32_t bd = 0, bf = 0;
++            if (F.stats(bd, bf)) fprintf(stderr, "[voxmap] scan %d: board counters: %u voxels forgotten, %u adds dropped (no free slot)\n", nscan, bf, bd);
 +        }
 +        if (voxmap::mode() == 2 && ++nscan % 300 == 0)
-+            fprintf(stderr, "[voxmap] scan %d: %ld voxels in the 2^16 x 8-slot table, %ld dropped (no free slot)\n",
-+                    nscan, voxmap::mapfx().n_voxels, voxmap::mapfx().dropped);
++            fprintf(stderr, "[voxmap] scan %d: %ld voxels added, %ld forgotten (keep %.1f m, 2^%d groups), %ld adds dropped (no free slot)\n",
++                    nscan, voxmap::mapfx().n_voxels, voxmap::mapfx().evicted, voxmap::mapfx().keep * 0.5,
++                    __builtin_popcount(voxmap::mapfx().gmask), voxmap::mapfx().dropped);
 +    }
      add_point_size = PointToAdd.size() + PointNoNeedDownsample.size();
      kdtree_incremental_time = omp_get_wtime() - st_time;
  }
-@@ -632,6 +648,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
+@@ -632,6 +651,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
      odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
      set_posestamp(odomAftMapped.pose);
      pubOdomAftMapped->publish(odomAftMapped);
@@ -112,7 +115,7 @@ index e5d9950..4fc5e4c 100644
      auto P = kf.get_P();
      for (int i = 0; i < 6; i ++)
      {
-@@ -676,11 +693,25 @@ void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
+@@ -676,11 +696,25 @@ void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
  
  void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data)
  {
@@ -138,7 +141,7 @@ index e5d9950..4fc5e4c 100644
      /** closest surface search and residual computation **/
      #ifdef MP_EN
          omp_set_num_threads(MP_PROC_NUM);
-@@ -706,6 +737,22 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
+@@ -706,6 +740,22 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
          if (ekfom_data.converge)
          {
              /** Find the closest surfaces in the map **/
@@ -161,7 +164,7 @@ index e5d9950..4fc5e4c 100644
              ikdtree.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis);
              point_selected_surf[i] = points_near.size() < NUM_MATCH_POINTS ? false : pointSearchSqDis[NUM_MATCH_POINTS - 1] > 5 ? false : true;
          }
-@@ -790,6 +837,11 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
+@@ -790,6 +840,11 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
          /*** Measuremnt: distance to the closest surface/corner ***/
          ekfom_data.h(i) = -norm_p.intensity;
      }
@@ -173,7 +176,7 @@ index e5d9950..4fc5e4c 100644
      solve_time += omp_get_wtime() - solve_start_;
  }
  
-@@ -924,9 +976,9 @@ public:
+@@ -924,9 +979,9 @@ public:
          }
          else
          {
@@ -185,7 +188,7 @@ index e5d9950..4fc5e4c 100644
          pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
          pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
          pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
-@@ -1009,6 +1061,9 @@ private:
+@@ -1009,6 +1064,9 @@ private:
                          pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
                      }
                      ikdtree.Build(feats_down_world->points);
@@ -454,10 +457,10 @@ index 0000000..3350684
 +}  // namespace fpga_hth
 diff --git a/include/voxmap.hpp b/include/voxmap.hpp
 new file mode 100644
-index 0000000..dafa88c
+index 0000000..746d3ca
 --- /dev/null
 +++ b/include/voxmap.hpp
-@@ -0,0 +1,311 @@
+@@ -0,0 +1,347 @@
 +// voxmap.hpp - FPGA-friendly replacement for the ikd-tree map (added 2026-11-10, phase 0 of the FPGA NN-search work)
 +//
 +// The map is a hash of 0.5 m voxels; each voxel holds at most CAP points (fixed-size bucket = one SDRAM burst later).
@@ -553,6 +556,11 @@ index 0000000..dafa88c
 +//   (uint32)(x + 1021*y + 262147*z) * 2654435761; a voxel lives in the first free slot of its group (tag = voxel
 +//   index); if all 8 are taken by other voxels it is dropped (counted). Distances are exact int64.
 +//   (first version used 2^18 slots, hash = low bits XOR, probe 2 -> 1.45 M dropped adds on eee_03)
++//   Forgetting (2026-11-10): when a new voxel finds its group full, the slot whose voxel is farthest from the new
++//   voxel (Chebyshev distance in voxels, lowest slot on ties) is reused if that distance is > keep; otherwise the
++//   add is dropped. New points lie within the LiDAR range r of the sensor, so keep >= 2 r only forgets voxels that
++//   are out of range. FPGA_NN_KEEP = keep in metres (default 200, 0 = never forget, max 2047 m);
++//   FPGA_NN_GBITS = log2 of the number of groups (default 16 = 16 MB; smaller only to test forgetting).
 +//   Search order (matters for ties): dx, dy, dz = -1..1 (dz fastest), points in slot order; a later point
 +//   replaces an earlier one only if strictly closer.
 +// ---------------------------------------------------------------------------------------------------------------
@@ -560,13 +568,22 @@ index 0000000..dafa88c
 +    static const int NGROUP = 1 << 16, WAYS = 8, NSLOT = NGROUP * WAYS;
 +    struct Slot { int n = 0; int32_t v[3]; int32_t p[CAP][3]; };
 +    std::vector<Slot> t;
-+    long dropped = 0, n_voxels = 0;
-+    MapFx() : t(NSLOT) {}
++    long dropped = 0, n_voxels = 0, evicted = 0;
++    uint32_t gmask = NGROUP - 1; int32_t keep = 400;          // keep radius in voxels (0.5 m)
++    MapFx() : t(NSLOT) { configure(); }
++    static int gbits_env() { const char *e = getenv("FPGA_NN_GBITS"); int b = e ? atoi(e) : 16; return b < 1 || b > 16 ? 16 : b; }
++    static int keep_env() {                                    // in voxels, 12 bits on the FPGA
++        const char *e = getenv("FPGA_NN_KEEP"); double m = e ? atof(e) : 200.0;
++        int k = (int)std::lrint(m * 2.0); return k < 0 ? 0 : k > 4095 ? 4095 : k;
++    }
++    // the CLEAR command's low 16 bits: [15:12] = gbits (0 = 16), [11:0] = keep in voxels
++    static uint32_t clear_cfg() { return ((uint32_t)(gbits_env() & 15) << 12) | (uint32_t)keep_env(); }
++    void configure() { gmask = (1u << gbits_env()) - 1; keep = keep_env(); }
 +
 +    static int32_t fx(float a) { return (int32_t)std::lrint((double)a * 65536.0); }
-+    static uint32_t group(const int32_t *v) {
++    uint32_t group(const int32_t *v) const {
 +        uint32_t s = (uint32_t)v[0] + (uint32_t)v[1] * 1021u + (uint32_t)v[2] * 262147u;
-+        return ((s * 2654435761u) >> 8) & (NGROUP - 1);
++        return ((s * 2654435761u) >> 8) & gmask;
 +    }
 +    static int64_t dc2(const int32_t *p, const int32_t *v) {          // squared distance to the voxel centre, Q32
 +        int64_t s = 0;
@@ -583,6 +600,17 @@ index 0000000..dafa88c
 +        for (int k = 0; k < WAYS; k++) {
 +            Slot &s = t[g + k];
 +            if (s.n == 0) { s.v[0] = v[0]; s.v[1] = v[1]; s.v[2] = v[2]; n_voxels++; return &s; }
++        }
++        if (keep > 0) {                                        // forget the farthest voxel of the group
++            int far = 0; int32_t fd = -1;
++            for (int k = 0; k < WAYS; k++) {
++                const Slot &s = t[g + k];
++                int32_t d = std::max(std::abs(s.v[0] - v[0]), std::max(std::abs(s.v[1] - v[1]), std::abs(s.v[2] - v[2])));
++                if (d > fd) { fd = d; far = k; }
++            }
++            if (fd > keep) {
++                Slot &s = t[g + far]; s.n = 0; s.v[0] = v[0]; s.v[1] = v[1]; s.v[2] = v[2]; evicted++; return &s;
++            }
 +        }
 +        dropped++;
 +        return nullptr;
@@ -664,7 +692,8 @@ index 0000000..dafa88c
 +// ---------------------------------------------------------------------------------------------------------------
 +// FPGA_NN_MODE=fpga : the map lives in the board's SDRAM (fpga_lio/fpga/nn). Same rules as MapFx, so the answers are
 +// bit-identical to mode voxfx. Adds are buffered and sent once per scan (flush_adds); searches are sent in batches.
-+// Packets: 0xA511|n + n ops x {flags, x, y, z} (<= 72 ops, <= 18 searches); 0xA513 = clear; reply 0xA512|n + n x 16 words.
++// Packets: 0xA511|n + n ops x {flags, x, y, z} (<= 72 ops, <= 18 searches); 0xA513|cfg = clear + configure;
++// 0xA514 = statistics; reply 0xA512|n + n x 16 words (statistics: 0xA5120000, dropped, forgotten).
 +// ---------------------------------------------------------------------------------------------------------------
 +struct FpgaNN {
 +    int sock = -1; sockaddr_in board{}; bool ok = false;
@@ -678,11 +707,11 @@ index 0000000..dafa88c
 +        timeval tv{1, 0}; setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 +        const char *host = getenv("FPGA_HTH_HOST");
 +        board.sin_family = AF_INET; board.sin_port = htons(1234); inet_pton(AF_INET, host ? host : "192.168.137.234", &board.sin_addr);
-+        std::vector<uint8_t> c; put(c, 0xA5130000u);                       // clear the map on the board
++        std::vector<uint8_t> c; put(c, 0xA5130000u | MapFx::clear_cfg());   // clear the map, set size + keep radius
 +        sendto(sock, c.data(), c.size(), 0, (sockaddr *)&board, sizeof(board));
 +        uint8_t rx[2048]; ok = recv(sock, rx, sizeof(rx), 0) >= 4;
-+        fprintf(stderr, "[voxmap] FPGA map %s (window %s packets)\n", ok ? "cleared, ready" : "DID NOT ANSWER",
-+                getenv("FPGA_NN_WINDOW") ? getenv("FPGA_NN_WINDOW") : "16");
++        fprintf(stderr, "[voxmap] FPGA map %s (window %s packets, 2^%d groups, keep %.1f m)\n", ok ? "cleared, ready" : "DID NOT ANSWER",
++                getenv("FPGA_NN_WINDOW") ? getenv("FPGA_NN_WINDOW") : "16", MapFx::gbits_env(), MapFx::keep_env() * 0.5);
 +    }
 +    // send packets with up to W in flight, collect replies in order; out_words gets every reply's search words
 +    // W = packets in flight. The board's receive FIFO holds 2048 words: a search packet is 73 words (16 fit),
@@ -697,6 +726,16 @@ index 0000000..dafa88c
 +            got++;
 +        }
 +        n_pkt += pk.size();
++    }
++    // the board's own counters (command 0xA514): adds dropped because the group was full, voxels forgotten
++    bool stats(uint32_t &dropped, uint32_t &forgotten) {
++        if (!ok) return false;
++        std::vector<uint8_t> c; put(c, 0xA5140000u);
++        sendto(sock, c.data(), c.size(), 0, (sockaddr *)&board, sizeof(board));
++        uint8_t rx[2048]; if (recv(sock, rx, sizeof(rx), 0) < 12) return false;
++        dropped = ((uint32_t)rx[4] << 24) | ((uint32_t)rx[5] << 16) | ((uint32_t)rx[6] << 8) | rx[7];
++        forgotten = ((uint32_t)rx[8] << 24) | ((uint32_t)rx[9] << 16) | ((uint32_t)rx[10] << 8) | rx[11];
++        return true;
 +    }
 +    void flush_adds() {
 +        if (pending_adds.empty() || !ok) { pending_adds.clear(); return; }

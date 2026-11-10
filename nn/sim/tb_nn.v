@@ -1,6 +1,7 @@
 `timescale 1ns/1ps
 // nn_core + sdram_rw + Micron SDRAM model: run the ops in nn_ops.mem, print every search result to nn_out.txt
 module tb_nn;
+    parameter CFG = 16'h0000;       // {gbits (0 = 16), keep in voxels}: iverilog -P tb_nn.CFG=...
     reg clk = 0, rst_n = 0;
     always #5 clk = ~clk;
     reg sdram_clk = 0;
@@ -17,9 +18,9 @@ module tb_nn;
         .Cas_n(cmd[1]), .We_n(cmd[0]), .Dqm(dqm));
 
     reg op_valid = 0, op_search = 0, op_ds = 0; reg [31:0] op_x = 0, op_y = 0, op_z = 0;
-    wire op_ready, res_valid; wire [2:0] res_found; wire [479:0] res_pts; wire [31:0] drop_cnt;
-    nn_core core (.clk(clk), .rst_n(rst_n), .op_valid(op_valid), .op_ready(op_ready), .op_search(op_search), .op_ds(op_ds),
-        .op_x(op_x), .op_y(op_y), .op_z(op_z), .clr_req(1'b0), .res_valid(res_valid), .res_found(res_found), .res_pts(res_pts),
+    wire op_ready, res_valid; wire [2:0] res_found; wire [479:0] res_pts; wire [31:0] drop_cnt, evict_cnt;
+    nn_core #(.DEF_CFG(CFG)) core (.clk(clk), .rst_n(rst_n), .op_valid(op_valid), .op_ready(op_ready), .op_search(op_search), .op_ds(op_ds),
+        .op_x(op_x), .op_y(op_y), .op_z(op_z), .clr_req(1'b0), .clr_cfg(16'd0), .evict_cnt(evict_cnt), .res_valid(res_valid), .res_found(res_found), .res_pts(res_pts),
         .drop_cnt(drop_cnt), .sd_ack(ack), .sd_done(done), .sd_req(sd_req), .sd_we(sd_we), .sd_addr(sd_addr),
         .sd_len(sd_len), .sd_wr_idx(wr_idx), .sd_wr_data(wr_data), .sd_rd_valid(rd_valid), .sd_rd_data(rd_data));
 
@@ -44,7 +45,7 @@ module tb_nn;
         end
         @(negedge clk); while (!op_ready) @(negedge clk);
         #1000;
-        $display("%0d ops, %0d search results, dropped %0d, %.1f us after init", nops, nres, drop_cnt, ($realtime - t0) / 1000.0);
+        $display("%0d ops, %0d search results, dropped %0d, forgotten %0d, %.1f us after init", nops, nres, drop_cnt, evict_cnt, ($realtime - t0) / 1000.0);
         $fclose(fo); $finish;
     end
 endmodule

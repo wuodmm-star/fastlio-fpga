@@ -4,7 +4,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import nn_model as N
 MAX_SEARCH = int(sys.argv[1]) if len(sys.argv) > 1 else 400
 EVERY = int(sys.argv[2]) if len(sys.argv) > 2 else 10
-M = N.Map(); ops = []; exp = []; ns = 0; seen = 0
+GBITS = int(sys.argv[3]) if len(sys.argv) > 3 else 16      # table size and keep radius (voxels): see nn_model.py
+KEEP = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+M = N.Map(GBITS, KEEP); ops = []; exp = []; ns = 0; seen = 0
 for rec in N.read_dump("nn.dump"):
     if rec[0] == "add":
         ops.append((0, rec[1]) + rec[2]); M.add(rec[2], rec[1])
@@ -21,4 +23,4 @@ with open("nn_ops.mem", "w") as f:
 with open("nn_expect.txt", "w") as f:
     for r in exp:
         f.write(f"{len(r)} " + " ".join(f"{c & 0xFFFFFFFF:08x}" for _, p in r for c in p) + "\n")
-print(f"{len(ops)} ops ({len(ops) - ns} adds, {ns} searches), golden dropped {M.dropped}, voxels {len(M.tag)}")
+print(f"{len(ops)} ops ({len(ops) - ns} adds, {ns} searches), golden dropped {M.dropped}, forgotten {M.evicted}, voxels {len(M.tag)}; CFG={(GBITS & 15) << 12 | KEEP}")
