@@ -123,4 +123,4 @@ WSL2 的 MTU 是 1200，所以每个 UDP 包不超过 1172 字节（查找包最
 
 [FAST-LIO](https://github.com/hku-mars/FAST_LIO)（HKU MARS）、野火电子教程代码、NTU-VIRAL 数据集、Micron SDRAM 模型。
 
-作者：A Gudamu（阿古大目）
+作者：A Gudamu（阿古达目）
