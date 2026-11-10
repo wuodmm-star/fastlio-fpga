@@ -105,4 +105,9 @@ read all 8 slot headers of a group. v2 layout: group words 0-1 = slot counts, 2-
 unchanged (same slot allocation and drop rule). Old core kept as rtl/nn_core_v1.v.
 - simulation: synthetic 2110/2110 and real 395/395 bit-exact; real ops ~740 clocks per search (1.9x faster)
 - Quartus: 7,048 LE (68 %), 24 multipliers, worst setup slack +0.215 ns at 100 MHz
-- hardware: synthetic 2110/2110, real 395/395 bit-exact; FAST-LIO closed loop running
+- hardware: synthetic 2110/2110, real 395/395 bit-exact
+- FAST-LIO closed loop, v2 (eee_03, 1810 scans, bag at 0.25x, 16 search packets in flight): 0 reply timeouts,
+  975,196 adds (2.0 ms per scan), 11,919,684 searches at 11.35 us each incl. the WSL->board round trip
+  (v1: 18.9 us) -> ~75 ms per scan for the searches, ~77 ms with the adds (10 Hz LiDAR budget: 100 ms).
+  **ATE 11.40 cm** (max 34.7 cm). With 4 packets in flight v2 gave no gain (20.2 us): the bottleneck had moved to
+  the per-packet cost of the WSL -> Windows -> board path.
