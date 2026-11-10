@@ -71,7 +71,7 @@ index 8c39e18..fff2d7a 100644
    <depend>livox_ros_driver2</depend>
  
 diff --git a/src/laserMapping.cpp b/src/laserMapping.cpp
-index e5d9950..540fd91 100644
+index e5d9950..aa33690 100644
 --- a/src/laserMapping.cpp
 +++ b/src/laserMapping.cpp
 @@ -32,6 +32,8 @@
@@ -198,6 +198,31 @@ index e5d9950..540fd91 100644
                  }
                  return;
              }
+@@ -1067,6 +1125,24 @@ private:
+             t3 = omp_get_wtime();
+             map_incremental();
+             t5 = omp_get_wtime();
++            {   // FPGA_VIZ_DUMP=file: this scan's pose and world-frame points (<= 6000) as records for an offline video
++                // (type u8, length u32, stamp f64, then 7 doubles (pose) or n x 4 floats (x, y, z, intensity))
++                static FILE *vf = getenv("FPGA_VIZ_DUMP") ? fopen(getenv("FPGA_VIZ_DUMP"), "wb") : nullptr;
++                if (vf) {
++                    double st = lidar_end_time, o[7] = {state_point.pos(0), state_point.pos(1), state_point.pos(2), state_point.rot.coeffs()[0],
++                                                        state_point.rot.coeffs()[1], state_point.rot.coeffs()[2], state_point.rot.coeffs()[3]};
++                    uint8_t k = 2; uint32_t ln = 8 + 56;
++                    fwrite(&k, 1, 1, vf); fwrite(&ln, 4, 1, vf); fwrite(&st, 8, 1, vf); fwrite(o, 8, 7, vf);
++                    size_t n = feats_undistort->points.size(), stp = n > 6000 ? (n + 5999) / 6000 : 1;
++                    std::vector<float> b;
++                    for (size_t i = 0; i < n; i += stp) {
++                        PointType w; pointBodyToWorld(&(feats_undistort->points[i]), &w);
++                        b.push_back(w.x); b.push_back(w.y); b.push_back(w.z); b.push_back(w.intensity);
++                    }
++                    k = 1; ln = 8 + 4 * (uint32_t)b.size();
++                    fwrite(&k, 1, 1, vf); fwrite(&ln, 4, 1, vf); fwrite(&st, 8, 1, vf); fwrite(b.data(), 4, b.size(), vf); fflush(vf);
++                }
++            }
+             
+             /******* Publish points *******/
+             if (path_en)                         publish_path(pubPath_);
 diff --git a/config/ntu_viral.yaml b/config/ntu_viral.yaml
 new file mode 100644
 index 0000000..2e11c47

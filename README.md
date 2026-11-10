@@ -6,6 +6,12 @@
 on-board 32 MB SDRAM and the FPGA answers every nearest-neighbour query, bit-exact against a golden model, with the
 same trajectory accuracy as the original.*
 
+![整段闭环：每一次近邻查找都由 FPGA 板子回答](docs/demo.gif)
+
+*上图：NTU-VIRAL eee_03 整段 1810 帧（约 3 倍速抽帧）。FAST-LIO 运行时每一次近邻查找都发给板子，共约 1192 万次、0 次超时；
+彩色点是累积的地图（按高度上色），白点是当前帧，红线是算出的轨迹。画面由 RViz 离线逐帧渲染（`eval/video/`），
+数据来自 FAST-LIO 的 `FPGA_VIZ_DUMP` 钩子；该数据集世界系 z 轴朝下，渲染时已翻正。*
+
 硬件：野火 征途Pro（Altera Cyclone IV EP4CE10F17C8，10,320 逻辑单元，32 MB SDRAM，百兆网口，无 ARM）。
 电脑跑 FAST-LIO 其余部分（ROS 2 Humble），经百兆网口 UDP 与板子通信。
 
@@ -66,7 +72,7 @@ LiDAR + IMU ──> PC: FAST-LIO (预处理 / IEKF / 拟合平面)
 - `hth/`：HᵀH / Hᵀh 累加引擎，单乘法器 54 条微码/点，80 位精确累加。见 [hth/SPEC.md](hth/SPEC.md)、[hth/RESULTS.md](hth/RESULTS.md)。
 - `fastlio_patch/`：FAST-LIO 补丁（`FPGA_NN_MODE=voxel|voxfx|fpga`、`FPGA_NN_KEEP`（保留半径，米，默认 200）、`FPGA_HTH_MODE=cpu|fixed|fpga`、录制与轨迹输出）。
 - `ethernet/`：以太网 UDP 收发（基于野火例程修改，见下）。
-- `common/`：双时钟 FIFO、测试用以太网帧构造工具。`eval/`：ATE 计算与回放脚本。
+- `common/`：双时钟 FIFO、测试用以太网帧构造工具。`eval/`：ATE 计算与回放脚本；`eval/video/`：把 `FPGA_VIZ_DUMP` 录下的每帧点云和位姿离线渲染成视频（虚拟显示器里的 RViz 逐帧截图）。
 
 ## 过程中找到并修掉的问题
 
